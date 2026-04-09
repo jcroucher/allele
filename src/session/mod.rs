@@ -1,5 +1,6 @@
 use gpui::*;
 use crate::terminal::TerminalView;
+use std::time::Instant;
 use uuid::Uuid;
 
 /// Status of a session
@@ -34,6 +35,7 @@ pub struct Session {
     pub label: String,
     pub terminal_view: Entity<TerminalView>,
     pub status: SessionStatus,
+    pub started_at: Instant,
 }
 
 impl Session {
@@ -43,6 +45,20 @@ impl Session {
             label,
             terminal_view,
             status: SessionStatus::Running,
+            started_at: Instant::now(),
+        }
+    }
+
+    /// Format elapsed time as a human-readable string
+    pub fn elapsed_display(&self) -> String {
+        let elapsed = self.started_at.elapsed();
+        let secs = elapsed.as_secs();
+        if secs < 60 {
+            format!("{secs}s")
+        } else if secs < 3600 {
+            format!("{}m {}s", secs / 60, secs % 60)
+        } else {
+            format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
         }
     }
 }

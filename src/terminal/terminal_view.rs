@@ -12,6 +12,16 @@ const CELL_HEIGHT: f32 = 18.0; // Line height
 const MIN_COLS: u16 = 20;
 const MIN_ROWS: u16 = 4;
 
+/// Events emitted by the terminal view to the parent
+#[derive(Debug, Clone)]
+pub enum TerminalEvent {
+    NewSession,
+    CloseSession,
+    SwitchSession(usize), // 0-indexed
+}
+
+impl EventEmitter<TerminalEvent> for TerminalView {}
+
 /// GPUI View wrapping a PTY-backed terminal
 pub struct TerminalView {
     terminal: Option<PtyTerminal>,
@@ -378,12 +388,28 @@ impl Render for TerminalView {
             .line_height(px(CELL_HEIGHT))
             .overflow_hidden()
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this: &mut Self, event: &KeyDownEvent, _window, _cx| {
-                let Some(ref terminal) = this.terminal else { return };
+            .on_key_down(cx.listener(|this: &mut Self, event: &KeyDownEvent, _window, cx| {
                 let key = event.keystroke.key.as_str();
                 let mods = &event.keystroke.modifiers;
 
-                // Handle control key combos first
+                // Handle Cmd shortcuts (emit to parent)
+                if mods.platform {
+                    match key {
+                        "n" => { cx.emit(TerminalEvent::NewSession); return; }
+                        "w" => { cx.emit(TerminalEvent::CloseSession); return; }
+                        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
+                            if let Ok(num) = key.parse::<usize>() {
+                                cx.emit(TerminalEvent::SwitchSession(num - 1));
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
+                let Some(ref terminal) = this.terminal else { return };
+
+                // Handle control key combos
                 if mods.control {
                     let ctrl_byte = match key {
                         "a" => Some(0x01), "b" => Some(0x02), "c" => Some(0x03),

@@ -6,14 +6,24 @@ mod state;
 
 use gpui::*;
 use session::{Session, SessionStatus};
-use terminal::{ShellCommand, TerminalView};
+use terminal::{ShellCommand, TerminalEvent, TerminalView};
 use terminal::pty_terminal::PtyTerminal;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+#[derive(Debug)]
+enum PendingAction {
+    NewSession,
+    CloseSession,
+    FocusActive,
+}
 
 struct AppState {
     sessions: Vec<Session>,
     active_session_idx: usize,
     claude_path: Option<String>,
+    next_session_num: usize,
+    pending_action: Option<PendingAction>,
 }
 
 impl AppState {
@@ -21,7 +31,6 @@ impl AppState {
         self.sessions.get(self.active_session_idx)
     }
 
-    /// Add a new session, optionally in an APFS clone of a project directory
     fn add_session(
         &mut self,
         working_dir: Option<PathBuf>,
@@ -29,16 +38,41 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let command = self.claude_path.as_ref().map(|p| ShellCommand::new(p.clone()));
-        let session_num = self.sessions.len() + 1;
+        let num = self.next_session_num;
+        self.next_session_num += 1;
         let display_label = if command.is_some() {
-            format!("Claude {session_num}")
+            format!("Claude {num}")
         } else {
-            format!("Shell {session_num}")
+            format!("Shell {num}")
         };
 
         let terminal_view = cx.new(|cx| {
             TerminalView::new(window, cx, command, working_dir)
         });
+
+        // Subscribe to terminal events (Cmd shortcuts)
+        // Note: subscribe doesn't give us Window access, so we queue actions
+        // and handle window-dependent ops (like focus) in the next render
+        cx.subscribe(&terminal_view, |this: &mut Self, _tv: Entity<TerminalView>, event: &TerminalEvent, cx: &mut Context<Self>| {
+            match event {
+                TerminalEvent::NewSession => {
+                    this.pending_action = Some(PendingAction::NewSession);
+                    cx.notify();
+                }
+                TerminalEvent::CloseSession => {
+                    this.pending_action = Some(PendingAction::CloseSession);
+                    cx.notify();
+                }
+                TerminalEvent::SwitchSession(target) => {
+                    let target = *target;
+                    if target < this.sessions.len() {
+                        this.active_session_idx = target;
+                        this.pending_action = Some(PendingAction::FocusActive);
+                        cx.notify();
+                    }
+                }
+            }
+        }).detach();
 
         let session = Session::new(display_label, terminal_view);
         self.sessions.push(session);
@@ -46,15 +80,34 @@ impl AppState {
         cx.notify();
     }
 
-    /// Add a new session in an APFS clone of the given project path
+    fn close_session(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sessions.is_empty() || idx >= self.sessions.len() {
+            return;
+        }
+        self.sessions.remove(idx);
+        // Adjust active index
+        if self.sessions.is_empty() {
+            self.active_session_idx = 0;
+        } else if self.active_session_idx >= self.sessions.len() {
+            self.active_session_idx = self.sessions.len() - 1;
+        } else if idx < self.active_session_idx {
+            self.active_session_idx -= 1;
+        }
+        // Re-focus the now-active session's terminal
+        if let Some(session) = self.sessions.get(self.active_session_idx) {
+            let fh = session.terminal_view.read(cx).focus_handle.clone();
+            fh.focus(window, cx);
+        }
+        cx.notify();
+    }
+
     fn add_cloned_session(
         &mut self,
         project_path: &Path,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let session_num = self.sessions.len() + 1;
-        let workspace_name = format!("workspace-{session_num}");
+        let workspace_name = format!("workspace-{}", self.next_session_num);
 
         match clone::create_clone(project_path, &workspace_name) {
             Ok(clone_path) => {
@@ -63,7 +116,6 @@ impl AppState {
             }
             Err(e) => {
                 eprintln!("Failed to create APFS clone: {e}");
-                // Fall back to non-cloned session
                 self.add_session(Some(project_path.to_path_buf()), window, cx);
             }
         }
@@ -95,7 +147,6 @@ fn main() {
                 ..Default::default()
             },
             move |window, cx| {
-                // Create the first session
                 let command = claude_path_clone.as_ref().map(|p| ShellCommand::new(p.clone()));
                 let label = if command.is_some() {
                     "Claude 1".to_string()
@@ -107,12 +158,39 @@ fn main() {
                     TerminalView::new(window, cx, command, None)
                 });
 
-                let first_session = Session::new(label, terminal_view);
+                let first_session = Session::new(label, terminal_view.clone());
+                let tv_for_sub = terminal_view.clone();
 
-                cx.new(|_cx| AppState {
-                    sessions: vec![first_session],
-                    active_session_idx: 0,
-                    claude_path: claude_path_clone,
+                cx.new(|cx: &mut Context<AppState>| {
+                    // Subscribe to first session's terminal events
+                    cx.subscribe(&tv_for_sub, |this: &mut AppState, _tv: Entity<TerminalView>, event: &TerminalEvent, cx: &mut Context<AppState>| {
+                        match event {
+                            TerminalEvent::NewSession => {
+                                this.pending_action = Some(PendingAction::NewSession);
+                                cx.notify();
+                            }
+                            TerminalEvent::CloseSession => {
+                                this.pending_action = Some(PendingAction::CloseSession);
+                                cx.notify();
+                            }
+                            TerminalEvent::SwitchSession(target) => {
+                                let target = *target;
+                                if target < this.sessions.len() {
+                                    this.active_session_idx = target;
+                                    this.pending_action = Some(PendingAction::FocusActive);
+                                    cx.notify();
+                                }
+                            }
+                        }
+                    }).detach();
+
+                    AppState {
+                        sessions: vec![first_session],
+                        active_session_idx: 0,
+                        claude_path: claude_path_clone,
+                        next_session_num: 2,
+                        pending_action: None,
+                    }
                 })
             },
         )
@@ -121,7 +199,26 @@ fn main() {
 }
 
 impl Render for AppState {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Process pending actions from keyboard shortcuts
+        if let Some(action) = self.pending_action.take() {
+            match action {
+                PendingAction::NewSession => {
+                    self.add_session(None, window, cx);
+                }
+                PendingAction::CloseSession => {
+                    let idx = self.active_session_idx;
+                    self.close_session(idx, window, cx);
+                }
+                PendingAction::FocusActive => {
+                    if let Some(session) = self.sessions.get(self.active_session_idx) {
+                        let fh = session.terminal_view.read(cx).focus_handle.clone();
+                        fh.focus(window, cx);
+                    }
+                }
+            }
+        }
+
         // Update session statuses from PTY state
         for session in &mut self.sessions {
             if session.status == SessionStatus::Running {
@@ -139,40 +236,72 @@ impl Render for AppState {
             let status_color = session.status.color();
             let status_icon = session.status.icon();
             let label = session.label.clone();
+            let elapsed = session.elapsed_display();
+            let is_done = session.status == SessionStatus::Done;
 
             session_items.push(
                 div()
                     .id(SharedString::from(format!("session-{idx}")))
                     .px(px(12.0))
                     .py(px(6.0))
-                    .cursor_pointer()
                     .bg(if is_active { rgb(0x313244) } else { rgb(0x181825) })
                     .hover(|s| s.bg(rgb(0x313244)))
                     .flex()
                     .flex_row()
                     .gap(px(8.0))
                     .items_center()
+                    .justify_between()
                     .child(
+                        // Left: clickable area for session selection
                         div()
-                            .text_size(px(10.0))
-                            .text_color(rgb(status_color))
-                            .child(status_icon.to_string()),
+                            .id(SharedString::from(format!("select-{idx}")))
+                            .flex_1()
+                            .cursor_pointer()
+                            .flex()
+                            .flex_row()
+                            .gap(px(6.0))
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(status_color))
+                                    .child(status_icon.to_string()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(if is_active { rgb(0xcdd6f4) } else { rgb(0x9399b2) })
+                                    .child(label),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(0x585b70))
+                                    .child(elapsed),
+                            )
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |this: &mut Self, _event, window, cx| {
+                                this.active_session_idx = idx;
+                                if let Some(session) = this.sessions.get(idx) {
+                                    let fh = session.terminal_view.read(cx).focus_handle.clone();
+                                    fh.focus(window, cx);
+                                }
+                                cx.notify();
+                            })),
                     )
                     .child(
+                        // Right: close button (separate click target)
                         div()
-                            .text_size(px(12.0))
-                            .text_color(if is_active { rgb(0xcdd6f4) } else { rgb(0x9399b2) })
-                            .child(label),
+                            .id(SharedString::from(format!("close-{idx}")))
+                            .cursor_pointer()
+                            .px(px(4.0))
+                            .text_size(px(11.0))
+                            .text_color(rgb(0x45475a))
+                            .hover(|s| s.text_color(rgb(0xf38ba8)))
+                            .child("✕")
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |this: &mut Self, _event, window, cx| {
+                                this.close_session(idx, window, cx);
+                            })),
                     )
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this: &mut Self, _event, window, cx| {
-                        this.active_session_idx = idx;
-                        // Focus the newly selected terminal
-                        if let Some(session) = this.sessions.get(idx) {
-                            let focus_handle = session.terminal_view.read(cx).focus_handle.clone();
-                            focus_handle.focus(window, cx);
-                        }
-                        cx.notify();
-                    }))
                     .into_any_element(),
             );
         }
@@ -182,12 +311,17 @@ impl Render for AppState {
         let done = self.sessions.iter().filter(|s| s.status == SessionStatus::Done).count();
         let total = self.sessions.len();
 
-        // Read FPS from active session's terminal view
         let fps = self.active_session()
             .map(|s| s.terminal_view.read(cx).current_fps)
             .unwrap_or(0);
 
+        // Check if active session has ended (for overlay)
+        let active_is_done = self.active_session()
+            .map(|s| s.status == SessionStatus::Done)
+            .unwrap_or(false);
+
         div()
+            .id("app-root")
             .flex()
             .size_full()
             .bg(rgb(0x1e1e2e))
@@ -219,7 +353,6 @@ impl Render for AppState {
                                     .font_weight(FontWeight::BOLD)
                                     .child("CC Multiplex"),
                             )
-                            // New session button
                             .child(
                                 div()
                                     .id("new-session-btn")
@@ -243,7 +376,7 @@ impl Render for AppState {
                             .overflow_hidden()
                             .children(session_items),
                     )
-                    // Status bar at bottom of sidebar
+                    // Status bar
                     .child(
                         div()
                             .px(px(12.0))
@@ -255,15 +388,60 @@ impl Render for AppState {
                             .child(format!("{total} sessions · {running} running · {done} done · {fps} fps")),
                     ),
             )
-            .child(
-                // Main terminal area — show active session
-                div()
+            .child({
+                // Main terminal area with optional "session ended" overlay
+                let mut main_area = div()
                     .flex_1()
                     .h_full()
-                    .children(
-                        self.active_session()
-                            .map(|s| s.terminal_view.clone().into_any_element())
-                    ),
-            )
+                    .relative();
+
+                if let Some(session) = self.active_session() {
+                    main_area = main_area.child(session.terminal_view.clone());
+                }
+
+                if active_is_done {
+                    main_area = main_area.child(
+                        // "Session ended" overlay bar at bottom
+                        div()
+                            .absolute()
+                            .bottom(px(0.0))
+                            .left(px(0.0))
+                            .right(px(0.0))
+                            .px(px(16.0))
+                            .py(px(10.0))
+                            .bg(rgb(0x313244))
+                            .border_t_1()
+                            .border_color(rgb(0x45475a))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(0x6c7086))
+                                    .child("Session ended"),
+                            )
+                            .child(
+                                div()
+                                    .id("restart-btn")
+                                    .cursor_pointer()
+                                    .px(px(10.0))
+                                    .py(px(4.0))
+                                    .rounded(px(4.0))
+                                    .bg(rgb(0x45475a))
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(0xcdd6f4))
+                                    .hover(|s| s.bg(rgb(0x585b70)))
+                                    .child("New Session")
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this: &mut Self, _event, window, cx| {
+                                        this.add_session(None, window, cx);
+                                    })),
+                            ),
+                    );
+                }
+
+                main_area
+            })
     }
 }
