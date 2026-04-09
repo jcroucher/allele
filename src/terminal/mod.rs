@@ -1,4 +1,5 @@
-mod pty_terminal;
+pub mod pty_terminal;
 mod terminal_view;
 
+pub use pty_terminal::ShellCommand;
 pub use terminal_view::TerminalView;

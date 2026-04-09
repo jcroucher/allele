@@ -3,10 +3,34 @@ use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config as TermConfig, Term};
-use alacritty_terminal::tty::{self, Options as PtyOptions};
+use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
 use alacritty_terminal::vte::ansi;
 use flume::{Receiver, Sender};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+
+/// A command to run in the PTY
+pub struct ShellCommand {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+impl ShellCommand {
+    pub fn new(program: impl Into<String>) -> Self {
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+        }
+    }
+
+    pub fn with_args(program: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            program: program.into(),
+            args,
+        }
+    }
+}
 
 /// Terminal size in cells and pixels
 #[derive(Debug, Clone, Copy)]
@@ -80,7 +104,17 @@ pub struct PtyTerminal {
 }
 
 impl PtyTerminal {
+    /// Create a terminal running the default shell
     pub fn new(size: TermSize) -> anyhow::Result<Self> {
+        Self::spawn(size, None, None)
+    }
+
+    /// Create a terminal running a specific command in a specific directory
+    pub fn spawn(
+        size: TermSize,
+        command: Option<ShellCommand>,
+        working_dir: Option<PathBuf>,
+    ) -> anyhow::Result<Self> {
         let (events_tx, events_rx) = flume::unbounded();
         let listener = JsonEventListener::new(events_tx);
 
@@ -94,11 +128,28 @@ impl PtyTerminal {
         let term = Term::new(term_config, &size, listener.clone());
         let term = Arc::new(FairMutex::new(term));
 
-        // Configure PTY options — launch default shell
+        // Build environment — ensure terminal capability is set correctly
+        let mut env = HashMap::new();
+        env.insert("TERM".to_string(), "xterm-256color".to_string());
+        env.insert("COLORTERM".to_string(), "truecolor".to_string());
+        // Ensure locale is set for proper unicode rendering
+        env.insert("LANG".to_string(), "en_AU.UTF-8".to_string());
+        env.insert("LC_ALL".to_string(), "en_AU.UTF-8".to_string());
+
+        // Build the shell configuration
+        let shell = command.map(|cmd| {
+            Shell::new(cmd.program, cmd.args)
+        });
+
+        let cwd = working_dir
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("/"));
+
+        // Configure PTY options
         let pty_options = PtyOptions {
-            shell: None, // uses $SHELL or default
-            working_directory: Some(std::env::current_dir().unwrap_or_default()),
-            env: std::collections::HashMap::new(),
+            shell,
+            working_directory: Some(cwd),
+            env,
             drain_on_exit: true,
             #[cfg(target_os = "windows")]
             escape_args: true,
@@ -119,6 +170,29 @@ impl PtyTerminal {
             events_rx,
             size,
         })
+    }
+
+    /// Find the claude binary on the system
+    pub fn find_claude() -> Option<PathBuf> {
+        // Check common locations
+        let candidates = [
+            // User-local install
+            dirs::home_dir().map(|h| h.join(".local/bin/claude")),
+            // npm global
+            dirs::home_dir().map(|h| h.join(".npm/bin/claude")),
+            // Homebrew
+            Some(PathBuf::from("/opt/homebrew/bin/claude")),
+            Some(PathBuf::from("/usr/local/bin/claude")),
+        ];
+
+        for candidate in candidates.into_iter().flatten() {
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+
+        // Fall back to PATH lookup
+        which::which("claude").ok()
     }
 
     /// Write input bytes to the PTY

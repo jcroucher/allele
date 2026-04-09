@@ -1,9 +1,10 @@
-use super::pty_terminal::{PtyTerminal, TermSize};
+use super::pty_terminal::{PtyTerminal, ShellCommand, TermSize};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 use gpui::*;
+use std::path::PathBuf;
 use std::time::Duration;
 
 const CELL_WIDTH: f32 = 7.6; // Approximate monospace char width at 13px
@@ -20,8 +21,14 @@ pub struct TerminalView {
 }
 
 impl TerminalView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let terminal = match PtyTerminal::new(TermSize::default()) {
+    /// Create a terminal view running a specific command, or default shell if None
+    pub fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        command: Option<ShellCommand>,
+        working_dir: Option<PathBuf>,
+    ) -> Self {
+        let terminal = match PtyTerminal::spawn(TermSize::default(), command, working_dir) {
             Ok(t) => Some(t),
             Err(e) => {
                 eprintln!("Failed to create PTY: {e}");
@@ -247,7 +254,6 @@ impl Render for TerminalView {
                         let fg = current_fg;
                         let bg = current_bg;
                         let b = current_bold;
-                        let i = current_italic;
                         let mut el = div().text_color(fg);
                         if let Some(bg_color) = bg {
                             el = el.bg(bg_color);
@@ -255,7 +261,6 @@ impl Render for TerminalView {
                         if b {
                             el = el.font_weight(FontWeight::BOLD);
                         }
-                        // italic not yet supported on Div at this GPUI rev
                         spans.push(el.child(text).into_any_element());
                     }
                     current_fg = cell_fg;
@@ -280,7 +285,6 @@ impl Render for TerminalView {
                 if current_bold {
                     el = el.font_weight(FontWeight::BOLD);
                 }
-                // italic not yet supported on Div at this GPUI rev
                 spans.push(el.child(text).into_any_element());
             }
 
@@ -316,39 +320,54 @@ impl Render for TerminalView {
             .focusable()
             .on_key_down(cx.listener(|this: &mut Self, event: &KeyDownEvent, _window, _cx| {
                 let Some(ref terminal) = this.terminal else { return };
+                let key = event.keystroke.key.as_str();
+                let mods = &event.keystroke.modifiers;
 
-                // Forward keystroke to PTY
-                if let Some(ref key_char) = event.keystroke.key_char {
-                    if event.keystroke.modifiers.control {
-                        // Handle ctrl+key combos
-                        if let Some(ch) = key_char.chars().next() {
-                            let ctrl_byte = (ch as u8).wrapping_sub(b'a').wrapping_add(1);
-                            terminal.write(&[ctrl_byte]);
-                            return;
-                        }
-                    }
-                    terminal.write(key_char.as_bytes());
-                } else {
-                    let bytes: Option<&[u8]> = match event.keystroke.key.as_str() {
-                        "enter" => Some(b"\r"),
-                        "backspace" => Some(b"\x7f"),
-                        "tab" => Some(b"\t"),
-                        "escape" => Some(b"\x1b"),
-                        "up" => Some(b"\x1b[A"),
-                        "down" => Some(b"\x1b[B"),
-                        "right" => Some(b"\x1b[C"),
-                        "left" => Some(b"\x1b[D"),
-                        "home" => Some(b"\x1b[H"),
-                        "end" => Some(b"\x1b[F"),
-                        "pageup" => Some(b"\x1b[5~"),
-                        "pagedown" => Some(b"\x1b[6~"),
-                        "delete" => Some(b"\x1b[3~"),
-                        "space" => Some(b" "),
+                // Handle control key combos first
+                if mods.control {
+                    let ctrl_byte = match key {
+                        "a" => Some(0x01), "b" => Some(0x02), "c" => Some(0x03),
+                        "d" => Some(0x04), "e" => Some(0x05), "f" => Some(0x06),
+                        "g" => Some(0x07), "h" => Some(0x08), "k" => Some(0x0b),
+                        "l" => Some(0x0c), "n" => Some(0x0e), "o" => Some(0x0f),
+                        "p" => Some(0x10), "r" => Some(0x12), "t" => Some(0x14),
+                        "u" => Some(0x15), "w" => Some(0x17), "z" => Some(0x1a),
                         _ => None,
                     };
-                    if let Some(bytes) = bytes {
-                        terminal.write(bytes);
+                    if let Some(byte) = ctrl_byte {
+                        terminal.write(&[byte]);
+                        return;
                     }
+                }
+
+                // Handle special keys BEFORE key_char — enter, backspace, etc.
+                // must be handled as control sequences, not as their character value
+                let special_bytes: Option<&[u8]> = match key {
+                    "enter" => Some(b"\r"),
+                    "backspace" => Some(b"\x7f"),
+                    "tab" => Some(b"\t"),
+                    "escape" => Some(b"\x1b"),
+                    "up" => Some(b"\x1b[A"),
+                    "down" => Some(b"\x1b[B"),
+                    "right" => Some(b"\x1b[C"),
+                    "left" => Some(b"\x1b[D"),
+                    "home" => Some(b"\x1b[H"),
+                    "end" => Some(b"\x1b[F"),
+                    "pageup" => Some(b"\x1b[5~"),
+                    "pagedown" => Some(b"\x1b[6~"),
+                    "delete" => Some(b"\x1b[3~"),
+                    "space" => Some(b" "),
+                    _ => None,
+                };
+
+                if let Some(bytes) = special_bytes {
+                    terminal.write(bytes);
+                    return;
+                }
+
+                // For regular character input, use key_char
+                if let Some(ref key_char) = event.keystroke.key_char {
+                    terminal.write(key_char.as_bytes());
                 }
             }))
             // Resize detection — fires when the terminal div is laid out
