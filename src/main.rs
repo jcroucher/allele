@@ -8,6 +8,7 @@ use gpui::*;
 use session::{Session, SessionStatus};
 use terminal::{ShellCommand, TerminalView};
 use terminal::pty_terminal::PtyTerminal;
+use std::path::{Path, PathBuf};
 
 struct AppState {
     sessions: Vec<Session>,
@@ -20,22 +21,52 @@ impl AppState {
         self.sessions.get(self.active_session_idx)
     }
 
-    fn add_session(&mut self, label: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// Add a new session, optionally in an APFS clone of a project directory
+    fn add_session(
+        &mut self,
+        working_dir: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let command = self.claude_path.as_ref().map(|p| ShellCommand::new(p.clone()));
+        let session_num = self.sessions.len() + 1;
         let display_label = if command.is_some() {
-            format!("Claude {}", self.sessions.len() + 1)
+            format!("Claude {session_num}")
         } else {
-            format!("Shell {}", self.sessions.len() + 1)
+            format!("Shell {session_num}")
         };
 
         let terminal_view = cx.new(|cx| {
-            TerminalView::new(window, cx, command, None)
+            TerminalView::new(window, cx, command, working_dir)
         });
 
         let session = Session::new(display_label, terminal_view);
         self.sessions.push(session);
         self.active_session_idx = self.sessions.len() - 1;
         cx.notify();
+    }
+
+    /// Add a new session in an APFS clone of the given project path
+    fn add_cloned_session(
+        &mut self,
+        project_path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let session_num = self.sessions.len() + 1;
+        let workspace_name = format!("workspace-{session_num}");
+
+        match clone::create_clone(project_path, &workspace_name) {
+            Ok(clone_path) => {
+                eprintln!("Created APFS clone at: {}", clone_path.display());
+                self.add_session(Some(clone_path), window, cx);
+            }
+            Err(e) => {
+                eprintln!("Failed to create APFS clone: {e}");
+                // Fall back to non-cloned session
+                self.add_session(Some(project_path.to_path_buf()), window, cx);
+            }
+        }
     }
 }
 
@@ -137,6 +168,11 @@ impl Render for AppState {
         let done = self.sessions.iter().filter(|s| s.status == SessionStatus::Done).count();
         let total = self.sessions.len();
 
+        // Read FPS from active session's terminal view
+        let fps = self.active_session()
+            .map(|s| s.terminal_view.read(cx).current_fps)
+            .unwrap_or(0);
+
         div()
             .flex()
             .size_full()
@@ -182,7 +218,7 @@ impl Render for AppState {
                                     .hover(|s| s.bg(rgb(0x313244)).text_color(rgb(0xa6e3a1)))
                                     .child("+")
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this: &mut Self, _event, window, cx| {
-                                        this.add_session("New".to_string(), window, cx);
+                                        this.add_session(None, window, cx);
                                     })),
                             ),
                     )
@@ -202,7 +238,7 @@ impl Render for AppState {
                             .border_color(rgb(0x313244))
                             .text_size(px(10.0))
                             .text_color(rgb(0x6c7086))
-                            .child(format!("{total} sessions · {running} running · {done} done")),
+                            .child(format!("{total} sessions · {running} running · {done} done · {fps} fps")),
                     ),
             )
             .child(

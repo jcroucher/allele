@@ -17,6 +17,9 @@ flume = "0.11"
 # Error handling
 anyhow = "1"
 
+# System FFI (clonefile)
+libc = "0.2"
+
 # Path utilities
 dirs = "6"
 which = "7"

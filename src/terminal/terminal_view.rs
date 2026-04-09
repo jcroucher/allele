@@ -5,7 +5,7 @@ use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 use gpui::*;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CELL_WIDTH: f32 = 7.6; // Approximate monospace char width at 13px
 const CELL_HEIGHT: f32 = 18.0; // Line height
@@ -18,6 +18,10 @@ pub struct TerminalView {
     error: Option<String>,
     last_cols: u16,
     last_rows: u16,
+    // FPS tracking
+    frame_count: u32,
+    last_fps_time: Instant,
+    pub current_fps: u32,
 }
 
 impl TerminalView {
@@ -37,6 +41,9 @@ impl TerminalView {
                     error: Some(format!("Failed to create PTY: {e}")),
                     last_cols: 80,
                     last_rows: 24,
+                    frame_count: 0,
+                    last_fps_time: Instant::now(),
+                    current_fps: 0,
                 };
             }
         };
@@ -73,6 +80,9 @@ impl TerminalView {
             error: None,
             last_cols: 80,
             last_rows: 24,
+            frame_count: 0,
+            last_fps_time: Instant::now(),
+            current_fps: 0,
         }
     }
 
@@ -173,6 +183,15 @@ impl TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // FPS tracking
+        self.frame_count += 1;
+        let elapsed = self.last_fps_time.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            self.current_fps = self.frame_count;
+            self.frame_count = 0;
+            self.last_fps_time = Instant::now();
+        }
+
         if let Some(ref error) = self.error {
             return div()
                 .size_full()
