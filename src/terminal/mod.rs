@@ -1,3 +1,4 @@
+mod grid_element;
 pub mod pty_terminal;
 mod terminal_view;
 

@@ -1,16 +1,12 @@
+use super::grid_element::TerminalGridElement;
 use super::pty_terminal::{PtyTerminal, ShellCommand, TermSize};
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::Flags as CellFlags;
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use gpui::*;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const FONT_FAMILY: &str = "JetBrains Mono";
 const FONT_SIZE: f32 = 13.0;
-const LINE_HEIGHT: f32 = 18.0;
-const DEFAULT_CELL_WIDTH: f32 = 7.6; // Fallback if measurement fails
 const MIN_COLS: u16 = 20;
 const MIN_ROWS: u16 = 4;
 
@@ -34,6 +30,7 @@ pub struct TerminalView {
     cell_width: f32,
     cell_height: f32,
     scroll_dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    scrollbar_dragging: bool,
     // FPS tracking
     frame_count: u32,
     last_fps_time: Instant,
@@ -50,15 +47,20 @@ impl TerminalView {
     ) -> Self {
         let focus_handle = cx.focus_handle();
 
-        // Cell width for terminal grid calculation.
-        //
-        // GPUI's text system reports JetBrains Mono advance width as 10.83px at 13px,
-        // but GPUI's div-based text rendering compresses glyphs tighter than the
-        // declared advance width. The actual rendered width per character is ~7.8px.
-        // This is an empirical value — proper fix requires GPUI's Element trait with
-        // per-cell positioned rendering (as Termy's grid.rs does).
-        let cell_width = 7.8_f32;
-        let cell_height = LINE_HEIGHT;
+        // Measure cell dimensions from the actual font via GPUI's text system.
+        // This value is used both for PTY resize (column/row count) and for
+        // the grid element's rendering, ensuring they agree.
+        let font = Font {
+            family: FONT_FAMILY.into(),
+            weight: FontWeight::NORMAL,
+            style: FontStyle::Normal,
+            features: FontFeatures::disable_ligatures(),
+            fallbacks: None,
+        };
+        let (measured_w, measured_h) =
+            TerminalGridElement::measure_cell(window, &font, px(FONT_SIZE));
+        let cell_width = f32::from(measured_w);
+        let cell_height = f32::from(measured_h);
 
         let terminal = match PtyTerminal::spawn(TermSize::default(), command, working_dir) {
             Ok(t) => Some(t),
@@ -73,6 +75,7 @@ impl TerminalView {
                     cell_width,
                     cell_height,
                     scroll_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    scrollbar_dragging: false,
                     frame_count: 0,
                     last_fps_time: Instant::now(),
                     current_fps: 0,
@@ -147,92 +150,11 @@ impl TerminalView {
             cell_width,
             cell_height,
             scroll_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            scrollbar_dragging: false,
             frame_count: 0,
             last_fps_time: Instant::now(),
             current_fps: 0,
         }
-    }
-
-    /// Convert an ANSI colour to GPUI Hsla
-    fn ansi_to_hsla(color: &AnsiColor) -> Hsla {
-        let rgba_val: u32 = match color {
-            AnsiColor::Named(named) => match named {
-                NamedColor::Black => 0x45475a,
-                NamedColor::Red => 0xf38ba8,
-                NamedColor::Green => 0xa6e3a1,
-                NamedColor::Yellow => 0xf9e2af,
-                NamedColor::Blue => 0x89b4fa,
-                NamedColor::Magenta => 0xcba6f7,
-                NamedColor::Cyan => 0x94e2d5,
-                NamedColor::White => 0xbac2de,
-                NamedColor::BrightBlack => 0x585b70,
-                NamedColor::BrightRed => 0xf38ba8,
-                NamedColor::BrightGreen => 0xa6e3a1,
-                NamedColor::BrightYellow => 0xf9e2af,
-                NamedColor::BrightBlue => 0x89b4fa,
-                NamedColor::BrightMagenta => 0xcba6f7,
-                NamedColor::BrightCyan => 0x94e2d5,
-                NamedColor::BrightWhite => 0xffffff,
-                NamedColor::Foreground => 0xcdd6f4,
-                NamedColor::Background => 0x1e1e2e,
-                _ => 0xcdd6f4,
-            },
-            AnsiColor::Spec(rgb_color) => {
-                return Hsla::from(Rgba {
-                    r: rgb_color.r as f32 / 255.0,
-                    g: rgb_color.g as f32 / 255.0,
-                    b: rgb_color.b as f32 / 255.0,
-                    a: 1.0,
-                });
-            }
-            AnsiColor::Indexed(idx) => {
-                match *idx {
-                    0 => 0x45475a,
-                    1 => 0xf38ba8,
-                    2 => 0xa6e3a1,
-                    3 => 0xf9e2af,
-                    4 => 0x89b4fa,
-                    5 => 0xcba6f7,
-                    6 => 0x94e2d5,
-                    7 => 0xbac2de,
-                    8 => 0x585b70,
-                    9 => 0xf38ba8,
-                    10 => 0xa6e3a1,
-                    11 => 0xf9e2af,
-                    12 => 0x89b4fa,
-                    13 => 0xcba6f7,
-                    14 => 0x94e2d5,
-                    15 => 0xffffff,
-                    // 16-231: 6x6x6 colour cube
-                    16..=231 => {
-                        let i = idx - 16;
-                        let r = (i / 36) * 51;
-                        let g = ((i / 6) % 6) * 51;
-                        let b = (i % 6) * 51;
-                        return Hsla::from(Rgba {
-                            r: r as f32 / 255.0,
-                            g: g as f32 / 255.0,
-                            b: b as f32 / 255.0,
-                            a: 1.0,
-                        });
-                    }
-                    // 232-255: grayscale ramp
-                    _ => {
-                        let v = (idx - 232) * 10 + 8;
-                        return Hsla::from(Rgba {
-                            r: v as f32 / 255.0,
-                            g: v as f32 / 255.0,
-                            b: v as f32 / 255.0,
-                            a: 1.0,
-                        });
-                    }
-                }
-            }
-        };
-        let r = ((rgba_val >> 16) & 0xFF) as f32 / 255.0;
-        let g = ((rgba_val >> 8) & 0xFF) as f32 / 255.0;
-        let b = (rgba_val & 0xFF) as f32 / 255.0;
-        Hsla::from(Rgba { r, g, b, a: 1.0 })
     }
 
     /// Focus this terminal view
@@ -278,7 +200,7 @@ impl Render for TerminalView {
                 .into_any_element();
         }
 
-        let Some(ref mut terminal) = self.terminal else {
+        let Some(ref terminal) = self.terminal else {
             return div()
                 .size_full()
                 .bg(rgb(0x1e1e2e))
@@ -286,132 +208,26 @@ impl Render for TerminalView {
                 .into_any_element();
         };
 
-        // Lock the terminal and read the grid
-        let term = terminal.term.lock();
-        let grid = term.grid();
-        let cursor_point = grid.cursor.point;
+        let font = Font {
+            family: FONT_FAMILY.into(),
+            weight: FontWeight::NORMAL,
+            style: FontStyle::Normal,
+            features: FontFeatures::disable_ligatures(),
+            fallbacks: None,
+        };
 
-        let num_lines = grid.screen_lines();
-        let num_cols = grid.columns();
-
-        // Build rows with per-cell colour spans
-        let mut row_elements: Vec<AnyElement> = Vec::with_capacity(num_lines);
-        let default_fg = Self::ansi_to_hsla(&AnsiColor::Named(NamedColor::Foreground));
-
-        for line_idx in 0..num_lines {
-            let mut spans: Vec<AnyElement> = Vec::new();
-            let mut current_text = String::new();
-            let mut current_fg = default_fg;
-            let mut current_bg: Option<Hsla> = None;
-            let mut current_bold = false;
-            let mut current_italic = false;
-
-            for col_idx in 0..num_cols {
-                let cell = &grid[Line(line_idx as i32)][Column(col_idx)];
-                let c = cell.c;
-                let is_cursor = line_idx == cursor_point.line.0 as usize
-                    && col_idx == cursor_point.column.0;
-
-                // Skip wide char spacers
-                if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
-                    continue;
-                }
-
-                let cell_fg = if is_cursor {
-                    Self::ansi_to_hsla(&AnsiColor::Named(NamedColor::Background))
-                } else {
-                    Self::ansi_to_hsla(&cell.fg)
-                };
-
-                let cell_bg = if is_cursor {
-                    Some(Self::ansi_to_hsla(&AnsiColor::Named(NamedColor::Foreground)))
-                } else {
-                    // Only set bg if it's not the default background
-                    let bg = Self::ansi_to_hsla(&cell.bg);
-                    let default_bg = Self::ansi_to_hsla(&AnsiColor::Named(NamedColor::Background));
-                    if bg != default_bg {
-                        Some(bg)
-                    } else {
-                        None
-                    }
-                };
-
-                let bold = cell.flags.contains(CellFlags::BOLD);
-                let italic = cell.flags.contains(CellFlags::ITALIC);
-
-                // If style changed, flush the current span
-                if cell_fg != current_fg
-                    || cell_bg != current_bg
-                    || bold != current_bold
-                    || italic != current_italic
-                {
-                    if !current_text.is_empty() {
-                        let text = std::mem::take(&mut current_text);
-                        let fg = current_fg;
-                        let bg = current_bg;
-                        let b = current_bold;
-                        let mut el = div().text_color(fg);
-                        if let Some(bg_color) = bg {
-                            el = el.bg(bg_color);
-                        }
-                        if b {
-                            el = el.font_weight(FontWeight::BOLD);
-                        }
-                        spans.push(el.child(text).into_any_element());
-                    }
-                    current_fg = cell_fg;
-                    current_bg = cell_bg;
-                    current_bold = bold;
-                    current_italic = italic;
-                }
-
-                let ch = if c == '\0' { ' ' } else { c };
-                current_text.push(ch);
-            }
-
-            // Flush remaining text in the row
-            if !current_text.is_empty() {
-                let text = current_text;
-                let fg = current_fg;
-                let bg = current_bg;
-                let mut el = div().text_color(fg);
-                if let Some(bg_color) = bg {
-                    el = el.bg(bg_color);
-                }
-                if current_bold {
-                    el = el.font_weight(FontWeight::BOLD);
-                }
-                spans.push(el.child(text).into_any_element());
-            }
-
-            // If empty row, push a space to maintain line height
-            if spans.is_empty() {
-                spans.push(div().child(" ").into_any_element());
-            }
-
-            row_elements.push(
-                div()
-                    .flex()
-                    .flex_row()
-                    .w_full()
-                    .children(spans)
-                    .into_any_element(),
-            );
-        }
-
-        drop(term);
-
-        // Capture cols/rows for resize detection closure
-        let last_cols = self.last_cols;
-        let last_rows = self.last_rows;
+        let grid_element = TerminalGridElement::new(
+            terminal.term.clone(),
+            font,
+            px(FONT_SIZE),
+            px(self.cell_width),
+            px(self.cell_height),
+        );
 
         div()
             .id("terminal")
             .size_full()
             .bg(rgb(0x1e1e2e))
-            .font_family(FONT_FAMILY)
-            .text_size(px(FONT_SIZE))
-            .line_height(px(self.cell_height))
             .overflow_hidden()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this: &mut Self, event: &KeyDownEvent, _window, cx| {
@@ -453,7 +269,6 @@ impl Render for TerminalView {
                 }
 
                 // Handle special keys BEFORE key_char — enter, backspace, etc.
-                // must be handled as control sequences, not as their character value
                 let special_bytes: Option<&[u8]> = match key {
                     "enter" => Some(b"\r"),
                     "backspace" => Some(b"\x7f"),
@@ -482,8 +297,77 @@ impl Render for TerminalView {
                     terminal.write(key_char.as_bytes());
                 }
             }))
-            // Scroll wheel handling — uses raw closure since on_scroll_wheel
-            // doesn't accept cx.listener pattern at this GPUI rev
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this: &mut Self, event: &MouseDownEvent, window, cx| {
+                    // Check if click is in scrollbar region (rightmost 12px)
+                    let viewport = window.viewport_size();
+                    let click_x = f32::from(event.position.x);
+                    let scrollbar_zone = f32::from(viewport.width) - 12.0;
+
+                    if click_x >= scrollbar_zone {
+                        let Some(ref terminal) = this.terminal else { return };
+                        let t = terminal.term.lock();
+                        let grid = t.grid();
+                        let total = grid.total_lines();
+                        let screen = grid.screen_lines();
+                        let history = total.saturating_sub(screen);
+                        drop(t);
+
+                        if history > 0 {
+                            this.scrollbar_dragging = true;
+                            // Set scroll position from click y
+                            let click_y = f32::from(event.position.y);
+                            let viewport_h = f32::from(viewport.height);
+                            let fraction = (click_y / viewport_h).clamp(0.0, 1.0);
+                            // fraction 0 = top (max offset), fraction 1 = bottom (offset 0)
+                            let new_offset = ((1.0 - fraction) * history as f32).round() as i32;
+                            let current = terminal.term.lock().grid().display_offset() as i32;
+                            let delta = new_offset - current;
+                            if delta != 0 {
+                                terminal.term.lock().scroll_display(Scroll::Delta(delta));
+                                this.scroll_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                                cx.notify();
+                            }
+                        }
+                    }
+                }),
+            )
+            .on_mouse_move(cx.listener(|this: &mut Self, event: &MouseMoveEvent, window, cx| {
+                if !this.scrollbar_dragging { return; }
+                let Some(ref terminal) = this.terminal else { return };
+                let t = terminal.term.lock();
+                let total = t.grid().total_lines();
+                let screen = t.grid().screen_lines();
+                let history = total.saturating_sub(screen);
+                let current_offset = t.grid().display_offset() as i32;
+                drop(t);
+
+                if history == 0 { return; }
+
+                let viewport_h = f32::from(window.viewport_size().height);
+                let mouse_y = f32::from(event.position.y);
+                let fraction = (mouse_y / viewport_h).clamp(0.0, 1.0);
+                let new_offset = ((1.0 - fraction) * history as f32).round() as i32;
+                let delta = new_offset - current_offset;
+                if delta != 0 {
+                    terminal.term.lock().scroll_display(Scroll::Delta(delta));
+                    this.scroll_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this: &mut Self, _event: &MouseUpEvent, _window, _cx| {
+                    this.scrollbar_dragging = false;
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this: &mut Self, _event: &MouseUpEvent, _window, _cx| {
+                    this.scrollbar_dragging = false;
+                }),
+            )
             .on_scroll_wheel({
                 let term = self.terminal.as_ref().map(|t| t.term.clone());
                 let scroll_dirty = self.scroll_dirty.clone();
@@ -491,18 +375,14 @@ impl Render for TerminalView {
                 move |event: &ScrollWheelEvent, _window: &mut Window, _cx: &mut App| {
                     let Some(ref term) = term else { return };
                     let delta = event.delta.pixel_delta(px(cell_h));
-                    // Convert pixel delta to line count
-                    // Positive delta.y = scroll up (natural scrolling) = show history
-                    // Scroll::Delta(positive) = scroll up in alacritty
                     let lines = (f32::from(delta.y) / cell_h).round() as i32;
                     if lines != 0 {
-                        use alacritty_terminal::grid::Scroll;
                         term.lock().scroll_display(Scroll::Delta(lines));
                         scroll_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             })
-            .children(row_elements)
+            .child(grid_element)
             .into_any_element()
     }
 }

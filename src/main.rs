@@ -126,6 +126,15 @@ fn main() {
     let application = Application::new();
 
     application.run(move |cx: &mut App| {
+        // Load bundled fonts so we have a deterministic monospace font
+        // regardless of what's installed on the system.
+        cx.text_system()
+            .add_fonts(vec![
+                std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf").as_slice()),
+                std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/JetBrainsMono-Bold.ttf").as_slice()),
+            ])
+            .expect("failed to load bundled fonts");
+
         let claude_path = PtyTerminal::find_claude()
             .map(|p| p.to_string_lossy().to_string());
 
