@@ -19,6 +19,10 @@ pub enum TerminalEvent {
     NewSession,
     CloseSession,
     SwitchSession(usize), // 0-indexed
+    /// Cycle to the previous running session (skips Suspended).
+    PrevSession,
+    /// Cycle to the next running session (skips Suspended).
+    NextSession,
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
@@ -315,21 +319,50 @@ impl TerminalView {
 
     /// Convert window-relative pixel position to visible screen cell (row, col).
     /// row is the visible row index (0..screen_lines), col is the column.
-    fn pixel_to_cell(&self, x: f32, y: f32) -> (usize, usize) {
+    /// Convert a window-relative pixel position into (row, col) grid
+    /// coordinates, clamped to the current grid bounds.
+    ///
+    /// Returns `None` if:
+    /// - there is no attached terminal
+    /// - the grid is zero-sized (transient during resize/init)
+    ///
+    /// This is the single source of "valid grid cell" truth — any pixel
+    /// position outside the grid area (padding, out of window, etc.) is
+    /// clamped to the nearest valid cell. Without this clamping, downstream
+    /// calls like `url_at` and `word_at` would build a `Line(row - offset)`
+    /// with `row >= screen_lines`, which trips alacritty's
+    /// `compute_index` debug_assert and aborts the app.
+    fn pixel_to_cell(&self, x: f32, y: f32) -> Option<(usize, usize)> {
         let origin_x = self.element_origin_x.load(std::sync::atomic::Ordering::Relaxed) as f32;
         let origin_y = self.element_origin_y.load(std::sync::atomic::Ordering::Relaxed) as f32;
         let local_x = (x - origin_x).max(0.0);
         let local_y = (y - origin_y).max(0.0);
-        let col = (local_x / self.cell_width).floor() as usize;
-        let row = (local_y / self.cell_height).floor() as usize;
-        (row, col)
+        let raw_col = (local_x / self.cell_width).floor() as usize;
+        let raw_row = (local_y / self.cell_height).floor() as usize;
+
+        let terminal = self.terminal.as_ref()?;
+        let term = terminal.term.lock();
+        let grid = term.grid();
+        let num_lines = grid.screen_lines();
+        let num_cols = grid.columns();
+        drop(term);
+
+        if num_lines == 0 || num_cols == 0 {
+            return None;
+        }
+
+        let row = raw_row.min(num_lines - 1);
+        let col = raw_col.min(num_cols - 1);
+        Some((row, col))
     }
 
     /// Convert window-relative pixel position to an alacritty line-coordinate cell.
     /// Returns (line_offset, col) where line_offset is negative for history,
     /// stable across scroll events. Use this for selection anchors.
-    fn pixel_to_line_cell(&self, x: f32, y: f32) -> (i32, usize) {
-        let (row, col) = self.pixel_to_cell(x, y);
+    ///
+    /// Returns `None` if the underlying `pixel_to_cell` does.
+    fn pixel_to_line_cell(&self, x: f32, y: f32) -> Option<(i32, usize)> {
+        let (row, col) = self.pixel_to_cell(x, y)?;
         let display_offset = self
             .terminal
             .as_ref()
@@ -338,7 +371,7 @@ impl TerminalView {
         // line_offset = visible_row - display_offset
         // (Same formula the renderer uses: grid_line = line_idx - display_offset)
         let line_offset = row as i32 - display_offset;
-        (line_offset, col)
+        Some((line_offset, col))
     }
 
     /// Get selected text from the terminal grid using alacritty line coordinates.
@@ -350,7 +383,18 @@ impl TerminalView {
         let terminal = self.terminal.as_ref()?;
         let term = terminal.term.lock();
         let grid = term.grid();
+        let num_lines = grid.screen_lines();
         let num_cols = grid.columns();
+        if num_lines == 0 || num_cols == 0 {
+            return None;
+        }
+        // Valid alacritty Line indices are [-history_size, num_lines-1].
+        // Persisted selection anchors can go stale if the grid resized since
+        // the selection was made — clamp to the current valid range before
+        // we touch any grid cell.
+        let history_size = grid.total_lines().saturating_sub(num_lines) as i32;
+        let min_line = -history_size;
+        let max_line = num_lines as i32 - 1;
 
         // Normalise: start <= end
         let (start_line, start_col, end_line, end_col) = if anchor.0 < extent.0
@@ -360,6 +404,14 @@ impl TerminalView {
         } else {
             (extent.0, extent.1, anchor.0, anchor.1)
         };
+
+        // Clamp to the current grid's visible range — if the selection was
+        // entirely outside the current grid, give up.
+        let start_line = start_line.clamp(min_line, max_line);
+        let end_line = end_line.clamp(min_line, max_line);
+        if start_line > end_line {
+            return None;
+        }
 
         let mut text = String::new();
         for line in start_line..=end_line {
@@ -905,6 +957,8 @@ impl Render for TerminalView {
                         }
                         "n" => { cx.emit(TerminalEvent::NewSession); return; }
                         "w" => { cx.emit(TerminalEvent::CloseSession); return; }
+                        "[" => { cx.emit(TerminalEvent::PrevSession); return; }
+                        "]" => { cx.emit(TerminalEvent::NextSession); return; }
                         "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
                             if let Ok(num) = key.parse::<usize>() {
                                 cx.emit(TerminalEvent::SwitchSession(num - 1));
@@ -1002,10 +1056,11 @@ impl Render for TerminalView {
 
                     // Cmd+click to open URLs
                     if event.modifiers.platform {
-                        let cell = this.pixel_to_cell(click_x, click_y);
-                        if let Some((_, _, _, url)) = this.url_at(cell) {
-                            let _ = std::process::Command::new("open").arg(&url).spawn();
-                            return;
+                        if let Some(cell) = this.pixel_to_cell(click_x, click_y) {
+                            if let Some((_, _, _, url)) = this.url_at(cell) {
+                                let _ = std::process::Command::new("open").arg(&url).spawn();
+                                return;
+                            }
                         }
                     }
 
@@ -1043,7 +1098,12 @@ impl Render for TerminalView {
                             }
                         }
                     } else {
-                        let line_cell = this.pixel_to_line_cell(click_x, click_y);
+                        // Bail out silently if the click landed outside the
+                        // grid area (padding region, zero-sized grid during
+                        // resize, etc.). Prevents downstream OOB grid access.
+                        let Some(line_cell) = this.pixel_to_line_cell(click_x, click_y) else {
+                            return;
+                        };
 
                         // Shift+click extends the existing selection
                         if event.modifiers.shift && this.selection_anchor.is_some() {
@@ -1109,8 +1169,12 @@ impl Render for TerminalView {
                         }
                     }
 
-                    let line_cell = this.pixel_to_line_cell(x, y);
-                    this.selection_extent = Some(line_cell);
+                    // Update the drag selection only if the mouse is still
+                    // inside the grid area. Outside positions are swallowed —
+                    // the selection continues to reflect the last in-bounds cell.
+                    if let Some(line_cell) = this.pixel_to_line_cell(x, y) {
+                        this.selection_extent = Some(line_cell);
+                    }
                     cx.notify();
                     return;
                 }
@@ -1119,8 +1183,12 @@ impl Render for TerminalView {
                 if event.modifiers.platform {
                     let x = f32::from(event.position.x);
                     let y = f32::from(event.position.y);
-                    let cell = this.pixel_to_cell(x, y);
-                    this.hovered_url = this.url_at(cell);
+                    // If the hover is out of grid bounds (padding, etc.)
+                    // clear any existing hovered URL. Prevents calling
+                    // url_at with an OOB cell.
+                    this.hovered_url = this
+                        .pixel_to_cell(x, y)
+                        .and_then(|cell| this.url_at(cell));
                     cx.notify();
                 } else if this.hovered_url.is_some() {
                     this.hovered_url = None;

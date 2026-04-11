@@ -13,6 +13,12 @@ pub enum SessionStatus {
     Done,
     /// Rehydrated from disk — no PTY attached yet. Click to cold-resume.
     Suspended,
+    /// Highest-priority attention state. Claude is blocked on a permission
+    /// prompt or a Notification-hook-level wait. User must act to unblock.
+    AwaitingInput,
+    /// Medium-priority attention state. Claude finished a response turn
+    /// (Stop hook). User should review and provide the next prompt.
+    ResponseReady,
 }
 
 impl SessionStatus {
@@ -22,15 +28,19 @@ impl SessionStatus {
             SessionStatus::Idle => "○",
             SessionStatus::Done => "✓",
             SessionStatus::Suspended => "⏸",
+            SessionStatus::AwaitingInput => "⚠",
+            SessionStatus::ResponseReady => "★",
         }
     }
 
     pub fn color(&self) -> u32 {
         match self {
-            SessionStatus::Running => 0xa6e3a1,   // green
-            SessionStatus::Idle => 0xf9e2af,      // yellow
-            SessionStatus::Done => 0x6c7086,      // grey
-            SessionStatus::Suspended => 0x89b4fa, // blue
+            SessionStatus::Running => 0xa6e3a1,       // green
+            SessionStatus::Idle => 0xf9e2af,          // yellow
+            SessionStatus::Done => 0x6c7086,          // grey
+            SessionStatus::Suspended => 0x89b4fa,     // blue
+            SessionStatus::AwaitingInput => 0xfab387, // peach — urgent, blocker
+            SessionStatus::ResponseReady => 0xcba6f7, // lavender — done, review
         }
     }
 }
@@ -110,10 +120,16 @@ impl Session {
     /// session stops ticking in the sidebar.
     pub fn elapsed_display(&self) -> String {
         let elapsed = match self.status {
-            SessionStatus::Suspended | SessionStatus::Done => self
+            // Frozen — timer stops ticking in the sidebar when the session
+            // is not actively running something.
+            SessionStatus::Suspended
+            | SessionStatus::Done
+            | SessionStatus::AwaitingInput
+            | SessionStatus::ResponseReady => self
                 .last_active
                 .duration_since(self.started_at)
                 .unwrap_or(Duration::ZERO),
+            // Live — still doing work.
             SessionStatus::Running | SessionStatus::Idle => self
                 .started_at
                 .elapsed()

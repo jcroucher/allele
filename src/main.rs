@@ -1,6 +1,7 @@
 mod terminal;
 mod sidebar;
 mod clone;
+mod hooks;
 mod project;
 mod session;
 mod settings;
@@ -53,6 +54,13 @@ struct AppState {
     /// the sidebar row at that cursor shows a confirm/cancel prompt instead
     /// of the usual buttons.
     confirming_discard: Option<SessionCursor>,
+    /// Absolute path to the cc-multiplex hooks.json, passed to claude via
+    /// `--settings <path>` at every spawn. `None` if install_if_missing
+    /// failed — in that case hooks are silently disabled and the app still
+    /// functions normally.
+    hooks_settings_path: Option<PathBuf>,
+    /// Current user settings (sound/notification preferences).
+    user_settings: Settings,
 }
 
 const SIDEBAR_MIN_WIDTH: f32 = 160.0;
@@ -69,6 +77,10 @@ impl AppState {
     }
 
     fn save_settings(&self) {
+        // Start from the live user_settings so attention preferences
+        // (sound/notification opt-ins) are preserved on every write, then
+        // override only the fields that the AppState is the source of truth
+        // for (sidebar width, project list, etc.).
         let settings = Settings {
             sidebar_width: self.sidebar_width,
             font_size: 13.0,
@@ -81,6 +93,7 @@ impl AppState {
                 name: p.name.clone(),
                 source_path: p.source_path.clone(),
             }).collect(),
+            ..self.user_settings.clone()
         };
         settings.save();
     }
@@ -161,17 +174,24 @@ impl AppState {
         // Build the claude command with --session-id + --name so our internal
         // UUID *is* Claude's session ID. This is what enables cold-resume later:
         // `claude --resume <same-uuid>` picks up the conversation in the same
-        // clone path.
+        // clone path. --settings injects cc-multiplex's attention-routing
+        // hooks so the Notification/Stop events flow back into the sidebar.
+        let hooks_path_str = self
+            .hooks_settings_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string());
         let command = self.claude_path.as_ref().map(|path| {
-            ShellCommand::with_args(
-                path.clone(),
-                vec![
-                    "--session-id".to_string(),
-                    session_id.clone(),
-                    "--name".to_string(),
-                    display_label.clone(),
-                ],
-            )
+            let mut args = vec![
+                "--session-id".to_string(),
+                session_id.clone(),
+                "--name".to_string(),
+                display_label.clone(),
+            ];
+            if let Some(hooks) = hooks_path_str {
+                args.push("--settings".to_string());
+                args.push(hooks);
+            }
+            ShellCommand::with_args(path.clone(), args)
         });
 
         // Add a loading placeholder immediately so the user sees feedback
@@ -255,6 +275,12 @@ impl AppState {
                                 }
                             }
                         }
+                        TerminalEvent::PrevSession => {
+                            this.navigate_session(-1, cx);
+                        }
+                        TerminalEvent::NextSession => {
+                            this.navigate_session(1, cx);
+                        }
                     }
                 }).detach();
 
@@ -308,6 +334,172 @@ impl AppState {
         cx.notify();
     }
 
+    /// Apply a single hook event to the matching session.
+    ///
+    /// Transition rules:
+    /// - `Notification` → `AwaitingInput` (permission prompt / idle wait)
+    /// - `Stop` → `ResponseReady` (Claude finished a response turn)
+    /// - `PreToolUse` / `PostToolUse` → `Running` (Claude is actively executing
+    ///   a tool, which means any prior permission prompt has been resolved)
+    /// - `UserPromptSubmit` → `Running` (user submitted new input)
+    /// - `SessionStart` → `Running`
+    /// - `SessionEnd` → `Done`
+    ///
+    /// Note: `Stop` no longer has special handling for `AwaitingInput`.
+    /// In practice Claude doesn't emit `Stop` while still blocked on a
+    /// prompt — `Stop` means the response turn completed, which implies
+    /// any prompt was resolved. The earlier "don't stomp" rule was
+    /// overly defensive and caused stuck AwaitingInput states in the wild.
+    fn apply_hook_event(&mut self, event: hooks::HookEvent, cx: &mut Context<Self>) {
+        // Find the matching session by its internal ID (= Claude session ID).
+        let Some((p_idx, s_idx)) = self.projects.iter().enumerate().find_map(|(p_idx, p)| {
+            p.sessions
+                .iter()
+                .position(|s| s.id == event.session_id)
+                .map(|s_idx| (p_idx, s_idx))
+        }) else {
+            // Event for an unknown session — probably stale, drop it.
+            return;
+        };
+
+        let Some(session) = self
+            .projects
+            .get_mut(p_idx)
+            .and_then(|p| p.sessions.get_mut(s_idx))
+        else {
+            return;
+        };
+
+        let prior = session.status;
+        let now = std::time::SystemTime::now();
+        session.last_active = now;
+
+        use hooks::HookKind;
+        use session::SessionStatus;
+
+        let new_status = match event.kind {
+            HookKind::Notification => Some(SessionStatus::AwaitingInput),
+            HookKind::Stop => Some(SessionStatus::ResponseReady),
+            HookKind::PreToolUse | HookKind::PostToolUse => {
+                // Tool execution is the key clearing signal. If Claude is
+                // running a tool, any prior permission prompt has been
+                // resolved and we should be back in Running. If we were
+                // already Running, this is a no-op (the prior==new guard
+                // below drops it).
+                Some(SessionStatus::Running)
+            }
+            HookKind::UserPromptSubmit => Some(SessionStatus::Running),
+            HookKind::SessionStart => Some(SessionStatus::Running),
+            HookKind::SessionEnd => Some(SessionStatus::Done),
+            HookKind::Other => None,
+        };
+
+        let Some(new_status) = new_status else { return };
+        if new_status == prior { return; }
+
+        session.status = new_status;
+
+        // Capture the label for notifications BEFORE we drop the borrow.
+        let session_label = session.label.clone();
+        let project_name = self
+            .projects
+            .get(p_idx)
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+
+        // Persist the updated status.
+        self.save_state();
+
+        // Fire sound + notification affordances — ONLY on transitions INTO
+        // an attention state, never on transitions out of one.
+        match new_status {
+            SessionStatus::AwaitingInput => {
+                if self.user_settings.sound_on_awaiting_input {
+                    let sound_path = self
+                        .user_settings
+                        .awaiting_input_sound_path
+                        .clone()
+                        .unwrap_or_else(|| settings::DEFAULT_AWAITING_INPUT_SOUND.to_string());
+                    hooks::play_sound(&sound_path);
+                }
+                if self.user_settings.notifications_enabled {
+                    hooks::show_notification(
+                        &format!("{project_name} — needs input"),
+                        &format!("{session_label} is blocked and waiting for you"),
+                    );
+                }
+            }
+            SessionStatus::ResponseReady => {
+                if self.user_settings.sound_on_response_ready {
+                    let sound_path = self
+                        .user_settings
+                        .response_ready_sound_path
+                        .clone()
+                        .unwrap_or_else(|| settings::DEFAULT_RESPONSE_READY_SOUND.to_string());
+                    hooks::play_sound(&sound_path);
+                }
+                if self.user_settings.notifications_enabled {
+                    hooks::show_notification(
+                        &format!("{project_name} — response ready"),
+                        &format!("{session_label} finished responding"),
+                    );
+                }
+            }
+            _ => {}
+        }
+
+        cx.notify();
+    }
+
+    /// Cycle the active session pointer across all non-Suspended sessions
+    /// in the flat order they appear in the sidebar. `delta = -1` = previous,
+    /// `delta = 1` = next. Wraps at both ends. Suspended sessions are
+    /// deliberately skipped — quick-flicking shouldn't auto-spawn resumed
+    /// Claude processes; the user clicks the ⏸ row explicitly to resume.
+    fn navigate_session(&mut self, delta: i32, cx: &mut Context<Self>) {
+        // Build the flat list of (project_idx, session_idx) for every
+        // attached (non-Suspended) session. This is the nav surface.
+        let flat: Vec<SessionCursor> = self
+            .projects
+            .iter()
+            .enumerate()
+            .flat_map(|(p_idx, project)| {
+                project
+                    .sessions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.status != SessionStatus::Suspended)
+                    .map(move |(s_idx, _)| SessionCursor {
+                        project_idx: p_idx,
+                        session_idx: s_idx,
+                    })
+            })
+            .collect();
+
+        if flat.is_empty() {
+            return;
+        }
+
+        // Find the active cursor's position in the flat list. If the current
+        // active is None or points at a Suspended session (not in `flat`),
+        // treat it as an implicit position before index 0 when moving forward,
+        // and after the last index when moving backward.
+        let current_pos = self
+            .active
+            .and_then(|active| flat.iter().position(|c| *c == active));
+
+        let len = flat.len() as i32;
+        let new_pos = match current_pos {
+            Some(pos) => (pos as i32 + delta).rem_euclid(len) as usize,
+            None if delta >= 0 => 0,
+            None => (len - 1) as usize,
+        };
+
+        self.active = Some(flat[new_pos]);
+        self.pending_action = Some(PendingAction::FocusActive);
+        cx.notify();
+    }
+
     /// Resume a Suspended session by spawning a fresh PTY with
     /// `claude --resume <id>` inside the stored clone_path.
     ///
@@ -341,16 +533,22 @@ impl AppState {
         let session_id = session.id.clone();
         let label = session.label.clone();
 
+        let hooks_path_str = self
+            .hooks_settings_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string());
         let command = self.claude_path.as_ref().map(|path| {
-            ShellCommand::with_args(
-                path.clone(),
-                vec![
-                    "--resume".to_string(),
-                    session_id.clone(),
-                    "--name".to_string(),
-                    label.clone(),
-                ],
-            )
+            let mut args = vec![
+                "--resume".to_string(),
+                session_id.clone(),
+                "--name".to_string(),
+                label.clone(),
+            ];
+            if let Some(hooks) = hooks_path_str {
+                args.push("--settings".to_string());
+                args.push(hooks);
+            }
+            ShellCommand::with_args(path.clone(), args)
         });
 
         // Build the new TerminalView on the main thread with window access.
@@ -371,8 +569,28 @@ impl AppState {
                     this.pending_action = Some(PendingAction::CloseActiveSession);
                     cx.notify();
                 }
-                TerminalEvent::SwitchSession(_) => {
-                    // Existing session switching is handled elsewhere; ignore here.
+                TerminalEvent::SwitchSession(target) => {
+                    // Mirror the fresh-spawn handler so Cmd+1..9 also works
+                    // from resumed sessions.
+                    let target = *target;
+                    let mut flat_idx = 0;
+                    'outer: for (p_idx, project) in this.projects.iter().enumerate() {
+                        for (s_idx, _) in project.sessions.iter().enumerate() {
+                            if flat_idx == target {
+                                this.active = Some(SessionCursor { project_idx: p_idx, session_idx: s_idx });
+                                this.pending_action = Some(PendingAction::FocusActive);
+                                cx.notify();
+                                break 'outer;
+                            }
+                            flat_idx += 1;
+                        }
+                    }
+                }
+                TerminalEvent::PrevSession => {
+                    this.navigate_session(-1, cx);
+                }
+                TerminalEvent::NextSession => {
+                    this.navigate_session(1, cx);
                 }
             }
         }).detach();
@@ -618,6 +836,20 @@ fn main() {
         let loaded_state = PersistedState::load();
         eprintln!("Loaded persisted state: {} sessions", loaded_state.sessions.len());
 
+        // Install the cc-multiplex hook receiver and settings file so every
+        // claude spawn can route attention signals back into the UI. Failure
+        // is non-fatal — the app still runs, it just won't get hook events.
+        let hooks_settings_path: Option<PathBuf> = match hooks::install_if_missing() {
+            Ok(path) => {
+                eprintln!("Installed cc-multiplex hooks at {}", path.display());
+                Some(path)
+            }
+            Err(e) => {
+                eprintln!("Failed to install cc-multiplex hooks: {e} (attention routing disabled)");
+                None
+            }
+        };
+
         // Conservative orphan sweep: move any on-disk clone not referenced by
         // the loaded state into ~/.cc-multiplex/trash/, then purge trash
         // entries older than TRASH_TTL_DAYS. This runs before the window
@@ -660,6 +892,7 @@ fn main() {
 
         let settings_for_window = loaded_settings.clone();
         let loaded_state_for_window = loaded_state.clone();
+        let hooks_settings_path_for_window = hooks_settings_path.clone();
 
         cx.open_window(
             WindowOptions {
@@ -688,6 +921,7 @@ fn main() {
                                 name: p.name.clone(),
                                 source_path: p.source_path.clone(),
                             }).collect(),
+                            ..this.user_settings.clone()
                         };
                         settings.save();
                     }).detach();
@@ -727,6 +961,40 @@ fn main() {
                         project.sessions.push(session);
                     }
 
+                    // Spawn the hook-event polling task. Runs for the life
+                    // of the app, reads ~/.cc-multiplex/events/*.jsonl every
+                    // 250ms, and routes each new event into apply_hook_event.
+                    //
+                    // Fast-forward existing files so we don't flood the user
+                    // with pre-existing events from a previous app session.
+                    cx.spawn(async move |this, cx| {
+                        let mut watcher = hooks::EventWatcher::new();
+                        watcher.initialize_offsets();
+
+                        loop {
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_millis(250))
+                                .await;
+
+                            let events = watcher.poll();
+                            if events.is_empty() {
+                                continue;
+                            }
+
+                            if this
+                                .update(cx, |this: &mut AppState, cx| {
+                                    for event in events {
+                                        this.apply_hook_event(event, cx);
+                                    }
+                                })
+                                .is_err()
+                            {
+                                break; // AppState dropped — app is exiting
+                            }
+                        }
+                    })
+                    .detach();
+
                     AppState {
                         projects,
                         active: None,
@@ -736,6 +1004,8 @@ fn main() {
                             .max(SIDEBAR_MIN_WIDTH),
                         sidebar_resizing: false,
                         confirming_discard: None,
+                        hooks_settings_path: hooks_settings_path_for_window,
+                        user_settings: settings_for_window.clone(),
                     }
                 })
             },
@@ -832,13 +1102,19 @@ impl Render for AppState {
         }
 
         // Update session statuses from PTY state.
-        // Only sessions with an attached PTY can transition Running → Done;
-        // Suspended sessions have no terminal_view and stay Suspended until
-        // explicitly resumed.
+        // Any attached session (Running, Idle, AwaitingInput, ResponseReady)
+        // can transition to Done when its PTY actually exits. Done and
+        // Suspended sessions are already terminal/attached-less and are
+        // skipped.
         let mut state_dirty = false;
         for project in &mut self.projects {
             for session in &mut project.sessions {
-                if session.status != SessionStatus::Running { continue; }
+                if matches!(
+                    session.status,
+                    SessionStatus::Done | SessionStatus::Suspended
+                ) {
+                    continue;
+                }
                 let Some(tv) = session.terminal_view.as_ref() else { continue; };
                 if tv.read(cx).has_exited() {
                     session.status = SessionStatus::Done;
@@ -1161,6 +1437,14 @@ impl Render for AppState {
             .flat_map(|p| p.sessions.iter())
             .filter(|s| s.status == SessionStatus::Running)
             .count();
+        let awaiting: usize = self.projects.iter()
+            .flat_map(|p| p.sessions.iter())
+            .filter(|s| s.status == SessionStatus::AwaitingInput)
+            .count();
+        let response_ready: usize = self.projects.iter()
+            .flat_map(|p| p.sessions.iter())
+            .filter(|s| s.status == SessionStatus::ResponseReady)
+            .count();
 
         let fps = self.active_session()
             .and_then(|s| s.terminal_view.as_ref())
@@ -1235,17 +1519,42 @@ impl Render for AppState {
                             .overflow_hidden()
                             .children(sidebar_items),
                     )
-                    // Status bar
-                    .child(
-                        div()
+                    // Status bar — attention summary lives here.
+                    // Counts are rendered as coloured children so the user
+                    // can glance at them and know which attention buckets
+                    // have something in them.
+                    .child({
+                        let mut bar = div()
                             .px(px(12.0))
                             .py(px(8.0))
                             .border_t_1()
                             .border_color(rgb(0x313244))
                             .text_size(px(10.0))
                             .text_color(rgb(0x6c7086))
-                            .child(format!("{total_projects} projects · {total_sessions} sessions · {running} running · {fps} fps")),
-                    ),
+                            .flex()
+                            .flex_row()
+                            .gap(px(8.0))
+                            .items_center()
+                            .child(format!(
+                                "{total_projects}p · {total_sessions}s · {running} running · {fps} fps"
+                            ));
+
+                        if awaiting > 0 {
+                            bar = bar.child(
+                                div()
+                                    .text_color(rgb(SessionStatus::AwaitingInput.color()))
+                                    .child(format!("⚠ {awaiting} need input")),
+                            );
+                        }
+                        if response_ready > 0 {
+                            bar = bar.child(
+                                div()
+                                    .text_color(rgb(SessionStatus::ResponseReady.color()))
+                                    .child(format!("★ {response_ready} ready")),
+                            );
+                        }
+                        bar
+                    }),
             )
             // Resize handle — 6px wide invisible hover zone over the sidebar border.
             // Sits between sidebar and main area, captures drag events.

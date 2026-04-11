@@ -24,10 +24,40 @@ pub struct Settings {
     pub window_height: Option<f32>,
     #[serde(default)]
     pub projects: Vec<ProjectSave>,
+
+    // --- attention routing -------------------------------------------------
+    /// Play a sound when a session transitions to AwaitingInput.
+    /// Default: ON (Patrick's primary attention channel).
+    #[serde(default = "default_true")]
+    pub sound_on_awaiting_input: bool,
+    /// Play a sound when a session transitions to ResponseReady.
+    /// Default: OFF (fires every response turn — too noisy by default).
+    #[serde(default)]
+    pub sound_on_response_ready: bool,
+    /// Fire a macOS notification on attention events.
+    /// Default: OFF (Patrick prefers sound over visual notifications).
+    #[serde(default)]
+    pub notifications_enabled: bool,
+    /// Override the default AwaitingInput sound path.
+    /// Default: `/System/Library/Sounds/Hero.aiff`.
+    #[serde(default)]
+    pub awaiting_input_sound_path: Option<String>,
+    /// Override the default ResponseReady sound path.
+    /// Default: `/System/Library/Sounds/Glass.aiff`.
+    #[serde(default)]
+    pub response_ready_sound_path: Option<String>,
 }
 
 fn default_sidebar_width() -> f32 { 240.0 }
 fn default_font_size() -> f32 { 13.0 }
+fn default_true() -> bool { true }
+
+/// Built-in macOS sound for AwaitingInput. Used when the user hasn't set
+/// a custom path in settings.json.
+pub const DEFAULT_AWAITING_INPUT_SOUND: &str = "/System/Library/Sounds/Hero.aiff";
+/// Built-in macOS sound for ResponseReady. Used when the user hasn't set
+/// a custom path in settings.json.
+pub const DEFAULT_RESPONSE_READY_SOUND: &str = "/System/Library/Sounds/Glass.aiff";
 
 impl Default for Settings {
     fn default() -> Self {
@@ -39,6 +69,11 @@ impl Default for Settings {
             window_width: None,
             window_height: None,
             projects: Vec::new(),
+            sound_on_awaiting_input: true,
+            sound_on_response_ready: false,
+            notifications_enabled: false,
+            awaiting_input_sound_path: None,
+            response_ready_sound_path: None,
         }
     }
 }
