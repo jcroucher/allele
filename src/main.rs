@@ -228,37 +228,91 @@ impl AppState {
         let display_label_for_task = display_label.clone();
 
         cx.spawn_in(window, async move |this, cx| {
-            // Run the clonefile() syscall on the background executor
+            // Capture canonical's state as a synthetic base commit BEFORE
+            // the COW clone so the clone's session branch can be rooted at
+            // a deterministic commit. If record_base_commit fails, the
+            // session still works — it just loses merge-back capability.
+            // If create_session_clone fails after we captured a base, we
+            // clean up the orphan ref before propagating the clone error.
             let clone_result = cx
                 .background_executor()
                 .spawn(async move {
-                    clone::create_session_clone(&source_for_task, &project_name_for_task, &session_id_for_clone)
+                    let base_commit = match git::record_base_commit(
+                        &source_for_task,
+                        &session_id_for_clone,
+                    ) {
+                        Ok(commit) => Some(commit),
+                        Err(e) => {
+                            eprintln!(
+                                "record_base_commit failed for {session_id_for_clone}: {e} \
+                                 (merge-back unavailable for this session)"
+                            );
+                            None
+                        }
+                    };
+                    match clone::create_session_clone(
+                        &source_for_task,
+                        &project_name_for_task,
+                        &session_id_for_clone,
+                    ) {
+                        Ok(path) => Ok((path, base_commit)),
+                        Err(e) => {
+                            if base_commit.is_some() {
+                                let _ =
+                                    git::delete_base_ref(&source_for_task, &session_id_for_clone);
+                            }
+                            Err(e)
+                        }
+                    }
                 })
                 .await;
 
             // Back on the main thread with window access
             let _ = this.update_in(cx, move |this: &mut Self, window, cx| {
-                // Resolve clone path (or fall back to source on failure)
-                let clone_path = match clone_result {
-                    Ok(p) => {
+                // Resolve clone path + base commit (or fall back to source
+                // with no base on failure — we must NOT create a session
+                // branch in the source_path fallback).
+                let (clone_path, base_commit) = match clone_result {
+                    Ok((p, base)) => {
                         eprintln!("Created APFS clone at: {}", p.display());
-                        p
+                        (p, base)
                     }
                     Err(e) => {
                         eprintln!("Failed to create APFS clone: {e}");
-                        source_path.clone()
+                        (source_path.clone(), None)
                     }
                 };
 
                 // Find the project again (indices may have shifted if user removed projects)
                 let Some(project) = this.projects.get_mut(project_idx) else {
-                    // Project was removed while we were cloning — clean up the clone
+                    // Project was removed while we were cloning — clean up
+                    // the clone and the orphan base ref (if any).
                     let _ = clone::delete_clone(&clone_path);
+                    if base_commit.is_some() {
+                        let _ = git::delete_base_ref(&source_path, &session_id_for_session);
+                    }
                     return;
                 };
 
                 // Remove the loading placeholder
                 project.loading_sessions.retain(|l| l.id != session_id);
+
+                // Create the session branch in the clone, rooted at the
+                // base commit captured pre-clone. The `base_commit.is_some()`
+                // guard is load-bearing: when the clone failed and we fell
+                // back to `source_path`, we must NOT create a branch in
+                // canonical — it would mutate canonical's HEAD.
+                if let Some(base) = base_commit.as_deref() {
+                    if let Err(e) = git::create_session_branch(
+                        &clone_path,
+                        base,
+                        &session_id_for_session,
+                    ) {
+                        eprintln!(
+                            "create_session_branch failed for {session_id_for_session}: {e}"
+                        );
+                    }
+                }
 
                 // Create the terminal view with the clone as PWD
                 let terminal_view = cx.new(|cx| {

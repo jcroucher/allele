@@ -27,13 +27,12 @@
 //! modifications AND untracked files without touching canonical's HEAD,
 //! index, or working tree. See [`record_base_commit`] for the implementation.
 //!
-//! ## Consumption state
+//! ## `dead_code` note
 //!
-//! Phase B consumes `git_available`, `is_git_repo`, and `git_init`. The
-//! rest (`record_base_commit`, `create_session_branch`, `fetch_session_branch`,
-//! `delete_ref`, `prune_archive_refs`) and the ref-name helpers remain
-//! unused until Phases C–F land, so the module-level `#![allow(dead_code)]`
-//! stays in place and comes off in Phase D.
+//! Not every public function in this module has a caller yet — Phases D–F
+//! of the merge-back rollout land the remaining consumers. The module-level
+//! `#![allow(dead_code)]` below stays in place until Phase D and comes off
+//! when the last consumer lands.
 
 #![allow(dead_code)]
 
@@ -323,6 +322,14 @@ pub fn delete_ref(repo: &Path, ref_name: &str) -> anyhow::Result<()> {
     cmd.arg("update-ref").arg("-d").arg(ref_name);
     run_git(cmd, "update-ref -d")?;
     Ok(())
+}
+
+/// Delete the synthetic base ref `refs/allele/base/<session-id>` from a
+/// canonical repo. Thin wrapper around [`delete_ref`] that keeps the ref
+/// namespace encapsulated in this module — callers never need to spell
+/// `base_ref_name(...)` themselves.
+pub fn delete_base_ref(repo: &Path, session_id: &str) -> anyhow::Result<()> {
+    delete_ref(repo, &base_ref_name(session_id))
 }
 
 /// Prune `refs/allele/archive/*` refs whose committer date is older than
