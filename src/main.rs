@@ -40,6 +40,8 @@ enum PendingAction {
     MergeArchive { project_idx: usize, archive_idx: usize },
     /// Delete an archive ref without merging.
     DeleteArchive { project_idx: usize, archive_idx: usize },
+    /// Toggle the bottom drawer terminal panel.
+    ToggleDrawer,
 }
 
 /// Position of a session in the project tree.
@@ -68,10 +70,15 @@ struct AppState {
     hooks_settings_path: Option<PathBuf>,
     /// Current user settings (sound/notification preferences).
     user_settings: Settings,
+    // Drawer terminal state
+    drawer_visible: bool,
+    drawer_height: f32,
+    drawer_resizing: bool,
 }
 
 const SIDEBAR_MIN_WIDTH: f32 = 160.0;
 const SIDEBAR_DEFAULT_WIDTH: f32 = 240.0;
+const DRAWER_MIN_HEIGHT: f32 = 100.0;
 
 impl AppState {
     /// Get the currently active session, if any.
@@ -100,6 +107,8 @@ impl AppState {
                 name: p.name.clone(),
                 source_path: p.source_path.clone(),
             }).collect(),
+            drawer_height: self.drawer_height,
+            drawer_visible: self.drawer_visible,
             ..self.user_settings.clone()
         };
         settings.save();
@@ -360,6 +369,10 @@ impl AppState {
                         TerminalEvent::NextSession => {
                             this.navigate_session(1, cx);
                         }
+                        TerminalEvent::ToggleDrawer => {
+                            this.pending_action = Some(PendingAction::ToggleDrawer);
+                            cx.notify();
+                        }
                     }
                 }).detach();
 
@@ -396,9 +409,10 @@ impl AppState {
         let Some(project) = self.projects.get_mut(cursor.project_idx) else { return; };
         let Some(session) = project.sessions.get_mut(cursor.session_idx) else { return; };
 
-        // Drop the terminal_view — Drop impl on PtyTerminal sends Msg::Shutdown,
-        // killing the subprocess. The clone on disk is untouched.
+        // Drop the terminal_view and drawer — Drop impl on PtyTerminal sends
+        // Msg::Shutdown, killing the subprocesses. The clone on disk is untouched.
         session.terminal_view = None;
+        session.drawer_terminal = None;
         session.status = SessionStatus::Suspended;
         session.last_active = std::time::SystemTime::now();
 
@@ -670,6 +684,10 @@ impl AppState {
                 }
                 TerminalEvent::NextSession => {
                     this.navigate_session(1, cx);
+                }
+                TerminalEvent::ToggleDrawer => {
+                    this.pending_action = Some(PendingAction::ToggleDrawer);
+                    cx.notify();
                 }
             }
         }).detach();
@@ -1183,6 +1201,10 @@ fn main() {
                         sidebar_resizing: false,
                         confirming_discard: None,
                         hooks_settings_path: hooks_settings_path_for_window,
+                        drawer_visible: settings_for_window.drawer_visible,
+                        drawer_height: settings_for_window.drawer_height
+                            .max(DRAWER_MIN_HEIGHT),
+                        drawer_resizing: false,
                         user_settings: settings_for_window.clone(),
                     }
                 })
@@ -1314,6 +1336,64 @@ impl Render for AppState {
                             }
                         }
                     }
+                }
+                PendingAction::ToggleDrawer => {
+                    self.drawer_visible = !self.drawer_visible;
+                    if self.drawer_visible {
+                        // Lazily spawn the drawer terminal for the active session
+                        if let Some(cursor) = self.active {
+                            let needs_spawn = self.projects
+                                .get(cursor.project_idx)
+                                .and_then(|p| p.sessions.get(cursor.session_idx))
+                                .map(|s| s.drawer_terminal.is_none())
+                                .unwrap_or(false);
+                            if needs_spawn {
+                                let working_dir = self.projects
+                                    .get(cursor.project_idx)
+                                    .and_then(|p| p.sessions.get(cursor.session_idx))
+                                    .and_then(|s| s.clone_path.clone());
+                                let drawer_tv = cx.new(|cx| {
+                                    TerminalView::new(window, cx, None, working_dir)
+                                });
+                                // Subscribe so Cmd+J from the drawer also toggles
+                                cx.subscribe(&drawer_tv, |this: &mut Self, _tv: Entity<TerminalView>, event: &TerminalEvent, cx: &mut Context<Self>| {
+                                    match event {
+                                        TerminalEvent::ToggleDrawer => {
+                                            this.pending_action = Some(PendingAction::ToggleDrawer);
+                                            cx.notify();
+                                        }
+                                        // Drawer terminal doesn't handle session-management events
+                                        _ => {}
+                                    }
+                                }).detach();
+                                if let Some(session) = self.projects
+                                    .get_mut(cursor.project_idx)
+                                    .and_then(|p| p.sessions.get_mut(cursor.session_idx))
+                                {
+                                    session.drawer_terminal = Some(drawer_tv);
+                                }
+                            }
+                            // Focus the drawer terminal
+                            if let Some(session) = self.projects
+                                .get(cursor.project_idx)
+                                .and_then(|p| p.sessions.get(cursor.session_idx))
+                            {
+                                if let Some(dt) = session.drawer_terminal.as_ref() {
+                                    let fh = dt.read(cx).focus_handle.clone();
+                                    fh.focus(window, cx);
+                                }
+                            }
+                        }
+                    } else {
+                        // Focus back to the main terminal when hiding drawer
+                        if let Some(session) = self.active_session() {
+                            if let Some(tv) = session.terminal_view.as_ref() {
+                                let fh = tv.read(cx).focus_handle.clone();
+                                fh.focus(window, cx);
+                            }
+                        }
+                    }
+                    self.save_settings();
                 }
             }
         }
@@ -1795,6 +1875,7 @@ impl Render for AppState {
 
         let sidebar_w = self.sidebar_width;
         let is_resizing = self.sidebar_resizing;
+        let drawer_is_resizing = self.drawer_resizing;
 
         // Outer non-flex container that hosts the flex row AND the drag overlay.
         // Keeping the overlay OUTSIDE the flex container ensures Taffy's layout
@@ -1909,96 +1990,152 @@ impl Render for AppState {
                     })),
             )
             .child({
-                // Main terminal area with optional "session ended" overlay
-                let mut main_area = div()
+                // Right-hand content column: main terminal + optional drawer
+                let mut content_col = div()
                     .flex_1()
                     .h_full()
-                    .relative();
+                    .flex()
+                    .flex_col();
 
-                if let Some(tv) = self.active_session().and_then(|s| s.terminal_view.clone()) {
-                    main_area = main_area.child(tv);
-                } else {
-                    // Empty-state placeholder
-                    main_area = main_area.child(
-                        div()
-                            .size_full()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .justify_center()
-                            .gap(px(16.0))
-                            .bg(rgb(0x1e1e2e))
-                            .child(
-                                div()
-                                    .text_size(px(16.0))
-                                    .text_color(rgb(0x6c7086))
-                                    .child("No active session"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(0x45475a))
-                                    .child("Click + in the sidebar to open a project"),
-                            ),
-                    );
+                // --- Main terminal area (flex_1, takes remaining space) ---
+                {
+                    let mut main_area = div()
+                        .flex_1()
+                        .min_h(px(100.0))
+                        .relative();
+
+                    if let Some(tv) = self.active_session().and_then(|s| s.terminal_view.clone()) {
+                        main_area = main_area.child(tv);
+                    } else {
+                        // Empty-state placeholder
+                        main_area = main_area.child(
+                            div()
+                                .size_full()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .justify_center()
+                                .gap(px(16.0))
+                                .bg(rgb(0x1e1e2e))
+                                .child(
+                                    div()
+                                        .text_size(px(16.0))
+                                        .text_color(rgb(0x6c7086))
+                                        .child("No active session"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(0x45475a))
+                                        .child("Click + in the sidebar to open a project"),
+                                ),
+                        );
+                    }
+
+                    if active_is_done {
+                        main_area = main_area.child(
+                            // "Session ended" overlay bar at bottom
+                            div()
+                                .absolute()
+                                .bottom(px(0.0))
+                                .left(px(0.0))
+                                .right(px(0.0))
+                                .px(px(16.0))
+                                .py(px(10.0))
+                                .bg(rgb(0x313244))
+                                .border_t_1()
+                                .border_color(rgb(0x45475a))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(0x6c7086))
+                                        .child("Session ended"),
+                                )
+                                .child(
+                                    div()
+                                        .id("restart-btn")
+                                        .cursor_pointer()
+                                        .px(px(10.0))
+                                        .py(px(4.0))
+                                        .rounded(px(4.0))
+                                        .bg(rgb(0x45475a))
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(0xcdd6f4))
+                                        .hover(|s| s.bg(rgb(0x585b70)))
+                                        .child("New Session")
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|this: &mut Self, _event, _window, cx| {
+                                            if let Some(active) = this.active {
+                                                this.pending_action = Some(PendingAction::AddSessionToProject(active.project_idx));
+                                                cx.notify();
+                                            }
+                                        })),
+                                ),
+                        );
+                    }
+
+                    content_col = content_col.child(main_area);
                 }
 
-                if active_is_done {
-                    main_area = main_area.child(
-                        // "Session ended" overlay bar at bottom
+                // --- Drawer terminal (fixed height, shown when drawer_visible) ---
+                let drawer_h = self.drawer_height;
+                if self.drawer_visible {
+                    // Resize handle — 6px tall invisible hover zone above drawer
+                    content_col = content_col.child(
                         div()
-                            .absolute()
-                            .bottom(px(0.0))
-                            .left(px(0.0))
-                            .right(px(0.0))
-                            .px(px(16.0))
-                            .py(px(10.0))
+                            .id("drawer-resize-handle")
+                            .w_full()
+                            .h(px(6.0))
+                            .cursor_row_resize()
                             .bg(rgb(0x313244))
-                            .border_t_1()
-                            .border_color(rgb(0x45475a))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(0x6c7086))
-                                    .child("Session ended"),
-                            )
-                            .child(
-                                div()
-                                    .id("restart-btn")
-                                    .cursor_pointer()
-                                    .px(px(10.0))
-                                    .py(px(4.0))
-                                    .rounded(px(4.0))
-                                    .bg(rgb(0x45475a))
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(0xcdd6f4))
-                                    .hover(|s| s.bg(rgb(0x585b70)))
-                                    .child("New Session")
-                                    .on_mouse_down(MouseButton::Left, cx.listener(|this: &mut Self, _event, _window, cx| {
-                                        if let Some(active) = this.active {
-                                            this.pending_action = Some(PendingAction::AddSessionToProject(active.project_idx));
-                                            cx.notify();
-                                        }
-                                    })),
-                            ),
+                            .hover(|s| s.bg(rgb(0x45475a)))
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this: &mut Self, _event, _window, cx| {
+                                this.drawer_resizing = true;
+                                cx.notify();
+                            })),
                     );
+
+                    // Drawer content
+                    let mut drawer_panel = div()
+                        .w_full()
+                        .h(px(drawer_h))
+                        .flex_shrink_0()
+                        .bg(rgb(0x1e1e2e));
+
+                    if let Some(dt) = self.active_session().and_then(|s| s.drawer_terminal.clone()) {
+                        drawer_panel = drawer_panel.child(dt);
+                    } else {
+                        drawer_panel = drawer_panel.child(
+                            div()
+                                .size_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(11.0))
+                                .text_color(rgb(0x45475a))
+                                .child("Terminal drawer"),
+                        );
+                    }
+                    content_col = content_col.child(drawer_panel);
                 }
 
-                main_area
+                content_col
             });
 
         // Outer wrapper: non-flex, relative-positioned container hosting both
         // the flex row and the optional drag overlay as siblings.
-        div()
+        let mut outer = div()
             .size_full()
             .relative()
-            .child(flex_row)
-            .children(if is_resizing {
-                vec![div()
+            .child(flex_row);
+
+        // Sidebar drag overlay
+        if is_resizing {
+            outer = outer.child(
+                div()
                     .id("sidebar-drag-overlay")
                     .absolute()
                     .top(px(0.0))
@@ -2020,10 +2157,40 @@ impl Render for AppState {
                         this.sidebar_resizing = false;
                         this.save_settings();
                         cx.notify();
+                    })),
+            );
+        }
+
+        // Drawer drag overlay
+        if drawer_is_resizing {
+            outer = outer.child(
+                div()
+                    .id("drawer-drag-overlay")
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .cursor_row_resize()
+                    .on_mouse_move(cx.listener(|this: &mut Self, event: &MouseMoveEvent, window, cx| {
+                        let viewport_h = f32::from(window.viewport_size().height);
+                        let mouse_y = f32::from(event.position.y);
+                        // Drawer height = distance from bottom of viewport to mouse
+                        let new_height = (viewport_h - mouse_y).clamp(DRAWER_MIN_HEIGHT, viewport_h - 200.0);
+                        if (new_height - this.drawer_height).abs() > 0.5 {
+                            this.drawer_height = new_height;
+                            window.refresh();
+                            cx.notify();
+                        }
                     }))
-                    .into_any_element()]
-            } else {
-                vec![]
-            })
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this: &mut Self, _event: &MouseUpEvent, _window, cx| {
+                        this.drawer_resizing = false;
+                        this.save_settings();
+                        cx.notify();
+                    })),
+            );
+        }
+
+        outer
     }
 }

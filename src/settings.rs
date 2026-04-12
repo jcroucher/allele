@@ -25,6 +25,12 @@ pub struct Settings {
     #[serde(default)]
     pub projects: Vec<ProjectSave>,
 
+    // --- drawer terminal ------------------------------------------------------
+    #[serde(default = "default_drawer_height")]
+    pub drawer_height: f32,
+    #[serde(default)]
+    pub drawer_visible: bool,
+
     // --- attention routing -------------------------------------------------
     /// Play a sound when a session transitions to AwaitingInput.
     /// Default: ON (Patrick's primary attention channel).
@@ -50,6 +56,7 @@ pub struct Settings {
 
 fn default_sidebar_width() -> f32 { 240.0 }
 fn default_font_size() -> f32 { 13.0 }
+fn default_drawer_height() -> f32 { 200.0 }
 fn default_true() -> bool { true }
 
 /// Built-in macOS sound for AwaitingInput. Used when the user hasn't set
@@ -69,6 +76,8 @@ impl Default for Settings {
             window_width: None,
             window_height: None,
             projects: Vec::new(),
+            drawer_height: default_drawer_height(),
+            drawer_visible: false,
             sound_on_awaiting_input: true,
             sound_on_response_ready: false,
             notifications_enabled: false,

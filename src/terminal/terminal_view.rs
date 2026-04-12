@@ -23,6 +23,8 @@ pub enum TerminalEvent {
     PrevSession,
     /// Cycle to the next running session (skips Suspended).
     NextSession,
+    /// Toggle the bottom drawer terminal panel.
+    ToggleDrawer,
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
@@ -965,6 +967,7 @@ impl Render for TerminalView {
                         "w" => { cx.emit(TerminalEvent::CloseSession); return; }
                         "[" => { cx.emit(TerminalEvent::PrevSession); return; }
                         "]" => { cx.emit(TerminalEvent::NextSession); return; }
+                        "j" => { cx.emit(TerminalEvent::ToggleDrawer); return; }
                         "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
                             if let Ok(num) = key.parse::<usize>() {
                                 cx.emit(TerminalEvent::SwitchSession(num - 1));

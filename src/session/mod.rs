@@ -64,6 +64,9 @@ pub struct Session {
     /// APFS clone path for this session. `None` means the session runs
     /// directly in the project source (fallback mode).
     pub clone_path: Option<PathBuf>,
+    /// Per-session drawer terminal (plain shell). Created lazily on first
+    /// toggle, persists across hide/show cycles.
+    pub drawer_terminal: Option<Entity<TerminalView>>,
 }
 
 impl Session {
@@ -81,6 +84,7 @@ impl Session {
             started_at: now,
             last_active: now,
             clone_path: None,
+            drawer_terminal: None,
         }
     }
 
@@ -104,6 +108,7 @@ impl Session {
             started_at,
             last_active,
             clone_path,
+            drawer_terminal: None,
         }
     }
 
