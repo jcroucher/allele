@@ -27,13 +27,13 @@
 //! modifications AND untracked files without touching canonical's HEAD,
 //! index, or working tree. See [`record_base_commit`] for the implementation.
 //!
-//! ## Phase A note
+//! ## Consumption state
 //!
-//! Phase A of the merge-back rollout ships this module as a self-contained
-//! foundation with no call sites in the rest of Allele. Integration lands
-//! in Phases B–F. Until then, the functions are exercised only by the unit
-//! tests — the `#![allow(dead_code)]` below reflects that on-purpose state
-//! and should be removed once Phase B starts consuming the module.
+//! Phase B consumes `git_available`, `is_git_repo`, and `git_init`. The
+//! rest (`record_base_commit`, `create_session_branch`, `fetch_session_branch`,
+//! `delete_ref`, `prune_archive_refs`) and the ref-name helpers remain
+//! unused until Phases C–F land, so the module-level `#![allow(dead_code)]`
+//! stays in place and comes off in Phase D.
 
 #![allow(dead_code)]
 

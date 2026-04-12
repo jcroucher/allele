@@ -351,3 +351,30 @@ pub fn show_notification(title: &str, body: &str) {
         let _ = (title, body);
     }
 }
+
+/// Show a blocking modal dialog via `osascript -e 'display dialog ...'`
+/// with a stop icon and a single OK button. Used for fatal startup errors
+/// that must block before the caller exits the process. Silently no-ops
+/// on non-macOS.
+pub fn show_fatal_dialog(title: &str, body: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        // Escape double quotes for AppleScript, then convert real newlines
+        // into AppleScript's `\n` escape sequence so they render as line
+        // breaks inside `display dialog`.
+        let escape = |s: &str| s.replace('"', "\\\"").replace('\n', "\\n");
+        let script = format!(
+            "display dialog \"{}\" with title \"{}\" with icon stop \
+             buttons {{\"OK\"}} default button 1",
+            escape(body),
+            escape(title)
+        );
+        let _ = Command::new("osascript").arg("-e").arg(script).status();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (title, body);
+    }
+}

@@ -141,8 +141,23 @@ impl AppState {
 
     /// Create a new project from a source path. Does NOT auto-create a session.
     /// Returns the index of the new project.
+    ///
+    /// This is the sole user-triggered project-add path — rehydration from
+    /// saved settings bypasses it and goes straight through `Project::new`,
+    /// so the silent `git_init` below only runs on genuinely new adds.
     fn create_project(&mut self, source_path: PathBuf, cx: &mut Context<Self>) -> usize {
         let name = Project::name_from_path(&source_path);
+
+        // Phase B: ensure the project is a git repo so session clones have
+        // a base to anchor against. `git_init` is idempotent — a no-op on
+        // existing repos — and non-fatal on failure.
+        if let Err(e) = git::git_init(&source_path) {
+            eprintln!(
+                "git_init: {} failed: {e} (continuing without git integration)",
+                source_path.display()
+            );
+        }
+
         let project = Project::new(name, source_path);
         self.projects.push(project);
         let idx = self.projects.len() - 1;
@@ -814,6 +829,17 @@ fn install_panic_hook() {
 
 fn main() {
     install_panic_hook();
+
+    // Hard dependency check: Allele treats git as non-optional. Fail
+    // loudly before any window opens if it's missing.
+    if !git::git_available() {
+        const MSG: &str = "Allele requires git but none was found on PATH.\n\n\
+                           Install the Xcode Command Line Tools with:\n\n    xcode-select --install";
+        eprintln!("{MSG}");
+        hooks::show_fatal_dialog("Allele", MSG);
+        std::process::exit(1);
+    }
+
     let application = Application::new();
 
     application.run(move |cx: &mut App| {
