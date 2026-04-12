@@ -36,6 +36,10 @@ enum PendingAction {
     /// Permanently delete the clone and remove the session from state.
     DiscardSession { project_idx: usize, session_idx: usize },
     SelectSession { project_idx: usize, session_idx: usize },
+    /// Merge an archived session ref into canonical's working tree.
+    MergeArchive { project_idx: usize, archive_idx: usize },
+    /// Delete an archive ref without merging.
+    DeleteArchive { project_idx: usize, archive_idx: usize },
 }
 
 /// Position of a session in the project tree.
@@ -1054,10 +1058,13 @@ fn main() {
                         settings.save();
                     }).detach();
 
-                    // Rehydrate projects from settings.
+                    // Rehydrate projects from settings, then load their
+                    // archive refs for the sidebar archive browser.
                     let mut projects: Vec<Project> = settings_for_window.projects.iter().map(|p| {
                         let mut proj = Project::new(p.name.clone(), p.source_path.clone());
                         proj.id = p.id.clone();
+                        proj.archives = git::list_archive_refs(&p.source_path)
+                            .unwrap_or_default();
                         proj
                     }).collect();
 
@@ -1202,6 +1209,45 @@ impl Render for AppState {
                         window,
                         cx,
                     );
+                }
+                PendingAction::MergeArchive { project_idx, archive_idx } => {
+                    if let Some(project) = self.projects.get_mut(project_idx) {
+                        if let Some(entry) = project.archives.get(archive_idx) {
+                            let session_id = entry.session_id.clone();
+                            match git::merge_archive(&project.source_path, &session_id) {
+                                Ok(()) => {
+                                    // Merge succeeded — clean up the archive ref and
+                                    // remove the entry from the UI.
+                                    let _ = git::delete_ref(
+                                        &project.source_path,
+                                        &git::archive_ref_name(&session_id),
+                                    );
+                                    project.archives.remove(archive_idx);
+                                    eprintln!("Merged archive {session_id} into canonical");
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "merge_archive failed for {session_id}: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    cx.notify();
+                }
+                PendingAction::DeleteArchive { project_idx, archive_idx } => {
+                    if let Some(project) = self.projects.get_mut(project_idx) {
+                        if let Some(entry) = project.archives.get(archive_idx) {
+                            let session_id = entry.session_id.clone();
+                            let _ = git::delete_ref(
+                                &project.source_path,
+                                &git::archive_ref_name(&session_id),
+                            );
+                            project.archives.remove(archive_idx);
+                            eprintln!("Deleted archive ref for {session_id}");
+                        }
+                    }
+                    cx.notify();
                 }
                 PendingAction::SelectSession { project_idx, session_idx } => {
                     let cursor = SessionCursor { project_idx, session_idx };
@@ -1555,6 +1601,127 @@ impl Render for AppState {
                 }
 
                 sidebar_items.push(row.into_any_element());
+            }
+
+            // Archived sessions for this project
+            if !project.archives.is_empty() {
+                // Section header
+                sidebar_items.push(
+                    div()
+                        .id(SharedString::from(format!("archives-header-{p_idx}")))
+                        .px(px(16.0))
+                        .py(px(4.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_size(px(9.0))
+                                .text_color(rgb(0x585b70))
+                                .child(format!("ARCHIVES ({})", project.archives.len())),
+                        )
+                        .into_any_element(),
+                );
+
+                for (a_idx, archive) in project.archives.iter().enumerate() {
+                    let short_id: String = archive.session_id.chars().take(8).collect();
+                    let age = {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let delta = now.saturating_sub(archive.timestamp);
+                        if delta < 60 { "just now".to_string() }
+                        else if delta < 3600 { format!("{}m ago", delta / 60) }
+                        else if delta < 86400 { format!("{}h ago", delta / 3600) }
+                        else { format!("{}d ago", delta / 86400) }
+                    };
+
+                    sidebar_items.push(
+                        div()
+                            .id(SharedString::from(format!("archive-{p_idx}-{a_idx}")))
+                            .pl(px(24.0))
+                            .pr(px(12.0))
+                            .py(px(3.0))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_row()
+                                    .gap(px(6.0))
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .text_size(px(10.0))
+                                            .text_color(rgb(0x585b70))
+                                            .child("📦"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.0))
+                                            .text_color(rgb(0x6c7086))
+                                            .child(short_id),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(9.0))
+                                            .text_color(rgb(0x45475a))
+                                            .child(age),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap(px(4.0))
+                                    .child(
+                                        // Merge button
+                                        div()
+                                            .id(SharedString::from(format!("merge-{p_idx}-{a_idx}")))
+                                            .cursor_pointer()
+                                            .px(px(4.0))
+                                            .py(px(1.0))
+                                            .rounded(px(3.0))
+                                            .text_size(px(9.0))
+                                            .text_color(rgb(0xa6e3a1))
+                                            .hover(|s| s.bg(rgb(0x313244)))
+                                            .child("merge")
+                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this: &mut Self, _event, _window, cx| {
+                                                cx.stop_propagation();
+                                                this.pending_action = Some(PendingAction::MergeArchive {
+                                                    project_idx: p_idx,
+                                                    archive_idx: a_idx,
+                                                });
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        // Delete button
+                                        div()
+                                            .id(SharedString::from(format!("delarchive-{p_idx}-{a_idx}")))
+                                            .cursor_pointer()
+                                            .px(px(4.0))
+                                            .text_size(px(10.0))
+                                            .text_color(rgb(0x45475a))
+                                            .hover(|s| s.text_color(rgb(0xf38ba8)))
+                                            .child("×")
+                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this: &mut Self, _event, _window, cx| {
+                                                cx.stop_propagation();
+                                                this.pending_action = Some(PendingAction::DeleteArchive {
+                                                    project_idx: p_idx,
+                                                    archive_idx: a_idx,
+                                                });
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .into_any_element(),
+                    );
+                }
             }
         }
 

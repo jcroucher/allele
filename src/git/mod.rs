@@ -27,16 +27,8 @@
 //! modifications AND untracked files without touching canonical's HEAD,
 //! index, or working tree. See [`record_base_commit`] for the implementation.
 //!
-//! ## `dead_code` note
-//!
-//! Not every public function in this module has a caller yet — Phases D–F
-//! of the merge-back rollout land the remaining consumers. The module-level
-//! `#![allow(dead_code)]` below stays in place until Phase D and comes off
-//! when the last consumer lands.
 
-#![allow(dead_code)]
-
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -407,6 +399,73 @@ pub fn prune_archive_refs(canonical: &Path, ttl_days: u64) -> anyhow::Result<usi
     Ok(pruned)
 }
 
+// --- Archive browsing + merging ------------------------------------------
+
+/// An archived session ref in canonical, ready to browse or merge.
+pub struct ArchiveEntry {
+    pub session_id: String,
+    #[allow(dead_code)] // stored for future display (tooltips, detail view)
+    pub commit_hash: String,
+    pub timestamp: u64, // unix epoch seconds
+}
+
+/// List all `refs/allele/archive/*` refs in `canonical`, sorted by
+/// timestamp (most recent first). Returns an empty vec if canonical is
+/// not a git repo or has no archive refs.
+pub fn list_archive_refs(canonical: &Path) -> anyhow::Result<Vec<ArchiveEntry>> {
+    if !is_git_repo(canonical) {
+        return Ok(Vec::new());
+    }
+    let mut cmd = git_cmd(Some(canonical));
+    cmd.arg("for-each-ref")
+        .arg("--format=%(refname)%09%(objectname:short)%09%(committerdate:unix)")
+        .arg("refs/allele/archive/");
+    let listing = run_git_stdout(cmd, "for-each-ref (list archives)")?;
+    if listing.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = Vec::new();
+    for line in listing.lines() {
+        let parts: Vec<&str> = line.splitn(3, '\t').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let session_id = parts[0]
+            .strip_prefix("refs/allele/archive/")
+            .unwrap_or(parts[0])
+            .to_string();
+        let commit_hash = parts[1].to_string();
+        let timestamp = parts[2].trim().parse::<u64>().unwrap_or(0);
+        entries.push(ArchiveEntry {
+            session_id,
+            commit_hash,
+            timestamp,
+        });
+    }
+    entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    Ok(entries)
+}
+
+/// Merge an archived session ref into canonical's current branch.
+/// Uses `--no-ff --no-edit` to preserve the merge as a distinct commit.
+/// Returns an error if there are merge conflicts or the working tree is
+/// dirty — the caller should display the error and let the user resolve
+/// conflicts manually.
+pub fn merge_archive(canonical: &Path, session_id: &str) -> anyhow::Result<()> {
+    if !is_git_repo(canonical) {
+        anyhow::bail!("merge_archive: not a git repo: {}", canonical.display());
+    }
+    let ref_name = archive_ref_name(session_id);
+    let mut cmd = git_cmd(Some(canonical));
+    cmd.arg("merge")
+        .arg("--no-ff")
+        .arg("--no-edit")
+        .arg(&ref_name);
+    run_git(cmd, "merge archive")?;
+    Ok(())
+}
+
 // --- Branch introspection -----------------------------------------------
 
 /// Read the current branch name (short form, e.g. `main` or
@@ -452,24 +511,6 @@ pub fn archive_ref_name(session_id: &str) -> String {
     format!("refs/allele/archive/{session_id}")
 }
 
-/// Return the short (8-char) session ID slug used for clone workspace
-/// directory naming, matching `crate::clone::create_session_clone`.
-pub fn short_session_id(session_id: &str) -> String {
-    session_id.chars().take(8).collect()
-}
-
-/// Convenience: synthesize the standard Allele clone path for a
-/// `(project_name, session_id)` pair. Mirrors `crate::clone::create_session_clone`'s
-/// layout so callers that want to resolve a clone path without poking
-/// into clone.rs internals can use this.
-pub fn default_clone_path(project_name: &str, session_id: &str) -> anyhow::Result<PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
-    Ok(home
-        .join(".allele/workspaces")
-        .join(project_name)
-        .join(short_session_id(session_id)))
-}
 
 // --- Tests --------------------------------------------------------------
 
@@ -477,6 +518,7 @@ pub fn default_clone_path(project_name: &str, session_id: &str) -> anyhow::Resul
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     /// Create a fresh canonical repo in a temp directory with a single
