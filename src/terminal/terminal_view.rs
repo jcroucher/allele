@@ -215,6 +215,16 @@ impl TerminalView {
                         let mut resize_committed = false;
                         if let Some((pending_size, recorded_at)) = this.pending_resize {
                             if recorded_at.elapsed() >= Duration::from_millis(RESIZE_DEBOUNCE_MS) {
+                                eprintln!(
+                                    "[RESIZE-DIAG] COMMIT: {}x{} -> {}x{} | debounce={:.0}ms | {:?}",
+                                    this.last_cols, this.last_rows,
+                                    pending_size.cols, pending_size.rows,
+                                    recorded_at.elapsed().as_millis(),
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_millis())
+                                        .unwrap_or(0),
+                                );
                                 this.last_cols = pending_size.cols;
                                 this.last_rows = pending_size.rows;
                                 if let Some(ref mut terminal) = this.terminal {
@@ -744,6 +754,19 @@ impl Render for TerminalView {
                             None => true,
                         };
                         if should_record {
+                            eprintln!(
+                                "[RESIZE-DIAG] RECORD: {}x{} -> {}x{} | origin=({:.1},{:.1}) viewport=({:.1},{:.1}) avail=({:.1},{:.1}) cell=({:.1},{:.1}) | {:?}",
+                                self.last_cols, self.last_rows,
+                                new_size.cols, new_size.rows,
+                                origin_x, origin_y,
+                                f32::from(viewport.width), f32::from(viewport.height),
+                                available_width, available_height,
+                                self.cell_width, self.cell_height,
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis())
+                                    .unwrap_or(0),
+                            );
                             self.pending_resize = Some((new_size, Instant::now()));
                         }
                     }
