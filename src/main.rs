@@ -13,7 +13,7 @@ use gpui::*;
 use project::Project;
 use session::{Session, SessionStatus};
 use settings::{ProjectSave, Settings};
-use state::{PersistedSession, PersistedState};
+use state::{ArchivedSession, PersistedSession, PersistedState};
 use terminal::{ShellCommand, TerminalEvent, TerminalView};
 use terminal::pty_terminal::PtyTerminal;
 use std::collections::HashMap;
@@ -117,6 +117,9 @@ impl AppState {
                     .sessions
                     .push(PersistedSession::from_session(session, &project.id));
             }
+            persisted
+                .archived_sessions
+                .extend(project.archives.iter().cloned());
         }
         if let Err(e) = persisted.save() {
             eprintln!("Failed to save state.json: {e}");
@@ -710,6 +713,20 @@ impl AppState {
         // Captured before drop(removed) / end of &mut project borrow.
         let canonical_for_task = project.source_path.clone();
         let session_id_for_task = removed.id.clone();
+
+        // Preserve the session's metadata in the archive list so the
+        // sidebar archive browser can show a human-readable label.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        project.archives.push(ArchivedSession {
+            id: removed.id.clone(),
+            project_id: project.id.clone(),
+            label: removed_label.clone(),
+            archived_at: now,
+        });
+
         // Drop the Session — this frees the terminal_view entity (if any),
         // which in turn kills the PTY via the Drop impl on PtyTerminal.
         // Suspended sessions have `terminal_view = None` so there's no PTY
@@ -1058,15 +1075,41 @@ fn main() {
                         settings.save();
                     }).detach();
 
-                    // Rehydrate projects from settings, then load their
-                    // archive refs for the sidebar archive browser.
+                    // Rehydrate projects from settings.
                     let mut projects: Vec<Project> = settings_for_window.projects.iter().map(|p| {
                         let mut proj = Project::new(p.name.clone(), p.source_path.clone());
                         proj.id = p.id.clone();
-                        proj.archives = git::list_archive_refs(&p.source_path)
-                            .unwrap_or_default();
                         proj
                     }).collect();
+
+                    // Rehydrate archived sessions from state.json so the
+                    // archive browser shows human-readable labels.
+                    for archived in &loaded_state_for_window.archived_sessions {
+                        if let Some(project) = projects.iter_mut().find(|p| p.id == archived.project_id) {
+                            project.archives.push(archived.clone());
+                        }
+                    }
+
+                    // Reconcile: any git archive refs without a state.json
+                    // entry (e.g., sessions archived before this change
+                    // landed) get a synthetic entry with the session ID as
+                    // the label so they still appear in the browser.
+                    for project in &mut projects {
+                        let known_ids: std::collections::HashSet<String> =
+                            project.archives.iter().map(|a| a.id.clone()).collect();
+                        if let Ok(git_entries) = git::list_archive_refs(&project.source_path) {
+                            for entry in git_entries {
+                                if !known_ids.contains(&entry.session_id) {
+                                    project.archives.push(ArchivedSession {
+                                        id: entry.session_id.clone(),
+                                        project_id: project.id.clone(),
+                                        label: format!("Session {}", &entry.session_id[..8.min(entry.session_id.len())]),
+                                        archived_at: entry.timestamp,
+                                    });
+                                }
+                            }
+                        }
+                    }
 
                     // Rehydrate sessions from state.json as Suspended entries
                     // (no PTY, ⏸ icon). They show up in the sidebar immediately
@@ -1213,11 +1256,9 @@ impl Render for AppState {
                 PendingAction::MergeArchive { project_idx, archive_idx } => {
                     if let Some(project) = self.projects.get_mut(project_idx) {
                         if let Some(entry) = project.archives.get(archive_idx) {
-                            let session_id = entry.session_id.clone();
+                            let session_id = entry.id.clone();
                             match git::merge_archive(&project.source_path, &session_id) {
                                 Ok(()) => {
-                                    // Merge succeeded — clean up the archive ref and
-                                    // remove the entry from the UI.
                                     let _ = git::delete_ref(
                                         &project.source_path,
                                         &git::archive_ref_name(&session_id),
@@ -1233,12 +1274,13 @@ impl Render for AppState {
                             }
                         }
                     }
+                    self.save_state();
                     cx.notify();
                 }
                 PendingAction::DeleteArchive { project_idx, archive_idx } => {
                     if let Some(project) = self.projects.get_mut(project_idx) {
                         if let Some(entry) = project.archives.get(archive_idx) {
-                            let session_id = entry.session_id.clone();
+                            let session_id = entry.id.clone();
                             let _ = git::delete_ref(
                                 &project.source_path,
                                 &git::archive_ref_name(&session_id),
@@ -1247,6 +1289,7 @@ impl Render for AppState {
                             eprintln!("Deleted archive ref for {session_id}");
                         }
                     }
+                    self.save_state();
                     cx.notify();
                 }
                 PendingAction::SelectSession { project_idx, session_idx } => {
@@ -1624,13 +1667,13 @@ impl Render for AppState {
                 );
 
                 for (a_idx, archive) in project.archives.iter().enumerate() {
-                    let short_id: String = archive.session_id.chars().take(8).collect();
+                    let display_label = archive.label.clone();
                     let age = {
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
-                        let delta = now.saturating_sub(archive.timestamp);
+                        let delta = now.saturating_sub(archive.archived_at);
                         if delta < 60 { "just now".to_string() }
                         else if delta < 3600 { format!("{}m ago", delta / 60) }
                         else if delta < 86400 { format!("{}h ago", delta / 3600) }
@@ -1664,7 +1707,7 @@ impl Render for AppState {
                                         div()
                                             .text_size(px(10.0))
                                             .text_color(rgb(0x6c7086))
-                                            .child(short_id),
+                                            .child(display_label),
                                     )
                                     .child(
                                         div()

@@ -1,5 +1,5 @@
-use crate::git;
 use crate::session::Session;
+use crate::state::ArchivedSession;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -19,9 +19,10 @@ pub struct Project {
     pub sessions: Vec<Session>,
     pub loading_sessions: Vec<LoadingSession>,
     pub expanded: bool,
-    /// Archived session refs in canonical (`refs/allele/archive/*`).
-    /// Populated at startup and updated on merge/delete actions.
-    pub archives: Vec<git::ArchiveEntry>,
+    /// Archived session metadata — populated from state.json at startup
+    /// and updated on merge/delete actions. The corresponding git refs
+    /// live in canonical as `refs/allele/archive/<session-id>`.
+    pub archives: Vec<ArchivedSession>,
 }
 
 impl Project {
