@@ -313,6 +313,25 @@ pub fn fetch_session_branch(
     Ok(())
 }
 
+/// Archive a clone's session work back into canonical and clean up the
+/// synthetic base ref. Pairs [`fetch_session_branch`] with
+/// [`delete_base_ref`] in the one order that matters: fetch first (while
+/// the clone still exists on disk), then best-effort base-ref cleanup.
+///
+/// Returns the fetch result — callers typically log it and proceed to
+/// delete/trash the clone regardless of outcome. The base-ref delete is
+/// always attempted and always silent (matches the Phase C cleanup
+/// pattern).
+pub fn archive_session(
+    canonical: &Path,
+    clone: &Path,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let fetch_result = fetch_session_branch(canonical, clone, session_id);
+    let _ = delete_base_ref(canonical, session_id);
+    fetch_result
+}
+
 /// Delete a ref. Equivalent to `git update-ref -d <ref>`.
 pub fn delete_ref(repo: &Path, ref_name: &str) -> anyhow::Result<()> {
     if !is_git_repo(repo) {

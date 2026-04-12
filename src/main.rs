@@ -701,18 +701,21 @@ impl AppState {
         let removed = project.sessions.remove(cursor.session_idx);
         let clone_path = removed.clone_path.clone();
         let removed_label = removed.label.clone();
+        // Captured before drop(removed) / end of &mut project borrow.
+        let canonical_for_task = project.source_path.clone();
+        let session_id_for_task = removed.id.clone();
         // Drop the Session — this frees the terminal_view entity (if any),
         // which in turn kills the PTY via the Drop impl on PtyTerminal.
         // Suspended sessions have `terminal_view = None` so there's no PTY
         // to kill; only the clone needs cleanup.
         drop(removed);
 
-        // Show a "Deleting…" placeholder if there's a clone to clean up
+        // Show an "Archiving…" placeholder if there's a clone to clean up
         let placeholder_id = uuid::Uuid::new_v4().to_string();
         if clone_path.is_some() {
             project.loading_sessions.push(project::LoadingSession {
                 id: placeholder_id.clone(),
-                label: format!("{removed_label} (deleting)"),
+                label: format!("{removed_label} (archiving)"),
             });
         }
 
@@ -748,14 +751,38 @@ impl AppState {
         self.save_state();
         cx.notify();
 
-        // Spawn the filesystem cleanup on a background task
+        // Spawn the archive-then-delete pipeline on a background task
         if let Some(clone_path) = clone_path {
             let project_idx = cursor.project_idx;
             let placeholder_id_for_task = placeholder_id.clone();
             cx.spawn(async move |this, cx| {
                 let delete_result = cx
                     .background_executor()
-                    .spawn(async move { clone::delete_clone(&clone_path) })
+                    .spawn(async move {
+                        // Degenerate case: if the session's "clone path"
+                        // is canonical itself (Phase C fallback when the
+                        // clonefile syscall failed), skip the archive
+                        // pipeline — no session branch exists, the fetch
+                        // would be a no-op self-fetch, and delete_clone
+                        // will bail on the workspace-dir safety check.
+                        if clone_path == canonical_for_task {
+                            return clone::delete_clone(&clone_path);
+                        }
+                        // Archive the session's work into canonical
+                        // before the clone dir is removed. Order is
+                        // load-bearing — archive_session must run while
+                        // the clone still exists.
+                        if let Err(e) = git::archive_session(
+                            &canonical_for_task,
+                            &clone_path,
+                            &session_id_for_task,
+                        ) {
+                            eprintln!(
+                                "archive_session failed for {session_id_for_task}: {e}"
+                            );
+                        }
+                        clone::delete_clone(&clone_path)
+                    })
                     .await;
 
                 if let Err(e) = delete_result {
