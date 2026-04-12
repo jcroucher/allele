@@ -983,6 +983,17 @@ fn main() {
             Err(e) => eprintln!("Trash purge failed: {e}"),
         }
 
+        // Prune archive refs older than the trash TTL so they don't
+        // accumulate indefinitely in canonical repos.
+        for p in &loaded_settings.projects {
+            if let Err(e) = git::prune_archive_refs(&p.source_path, clone::TRASH_TTL_DAYS) {
+                eprintln!(
+                    "prune_archive_refs failed for {}: {e}",
+                    p.source_path.display()
+                );
+            }
+        }
+
         let claude_path = PtyTerminal::find_claude()
             .map(|p| p.to_string_lossy().to_string());
 
