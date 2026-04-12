@@ -805,4 +805,148 @@ mod tests {
         assert!(resolve_ref(&path, &archive_ref_name("old01")).is_none());
         assert!(resolve_ref(&path, &archive_ref_name("fresh01")).is_some());
     }
+
+    // --- Phase G: tests for B–F additions --------------------------------
+
+    #[test]
+    fn current_branch_returns_branch_name() {
+        let (_dir, path) = make_canonical("hello");
+        // make_canonical leaves HEAD on the default branch (usually "master")
+        let branch = current_branch(&path);
+        assert!(branch.is_some(), "expected a branch name");
+        assert!(!branch.unwrap().is_empty());
+    }
+
+    #[test]
+    fn current_branch_returns_none_for_detached_head() {
+        let (_dir, path) = make_canonical("hello");
+        let head = head_commit(&path);
+        // Detach HEAD by checking out the commit directly
+        let mut cmd = git_cmd(Some(&path));
+        cmd.arg("checkout").arg("--detach").arg(&head);
+        run_git(cmd, "detach HEAD (test)").unwrap();
+        assert!(current_branch(&path).is_none());
+    }
+
+    #[test]
+    fn current_branch_returns_none_for_non_git_dir() {
+        let dir = TempDir::new().unwrap();
+        assert!(current_branch(dir.path()).is_none());
+    }
+
+    #[test]
+    fn session_id_from_branch_extracts_id() {
+        assert_eq!(
+            session_id_from_branch("allele/session/abc12345"),
+            Some("abc12345")
+        );
+    }
+
+    #[test]
+    fn session_id_from_branch_rejects_other_branches() {
+        assert_eq!(session_id_from_branch("main"), None);
+        assert_eq!(session_id_from_branch("allele/archive/abc"), None);
+        assert_eq!(session_id_from_branch(""), None);
+    }
+
+    #[test]
+    fn delete_base_ref_removes_existing() {
+        let (_dir, path) = make_canonical("hello");
+        record_base_commit(&path, "delbr01").unwrap();
+        assert!(resolve_ref(&path, &base_ref_name("delbr01")).is_some());
+
+        delete_base_ref(&path, "delbr01").unwrap();
+        assert!(resolve_ref(&path, &base_ref_name("delbr01")).is_none());
+    }
+
+    #[test]
+    fn archive_session_creates_archive_and_cleans_base() {
+        // Set up canonical + "clone" (second repo sharing history)
+        let (_cdir, canonical) = make_canonical("base");
+        let base = record_base_commit(&canonical, "archtest01").unwrap();
+
+        // Create a second repo to act as the clone
+        let clone_dir = TempDir::new().unwrap();
+        let clone_path = clone_dir.path().to_path_buf();
+        git_init(&clone_path).unwrap();
+
+        // Fetch the base commit into the clone and create session branch
+        let mut cmd = git_cmd(Some(&clone_path));
+        cmd.arg("fetch")
+            .arg(&canonical)
+            .arg(format!("{base}:refs/allele/base/archtest01"));
+        run_git(cmd, "fetch base into clone (test)").unwrap();
+        create_session_branch(&clone_path, &base, "archtest01").unwrap();
+
+        // Do some work in the clone
+        fs::write(clone_path.join("work.txt"), "session work").unwrap();
+        let mut cmd = git_cmd(Some(&clone_path));
+        cmd.arg("add").arg("-A");
+        run_git(cmd, "add (test)").unwrap();
+        let mut cmd = git_cmd(Some(&clone_path));
+        cmd.arg("commit").arg("--no-verify").arg("-m").arg("work");
+        run_git(cmd, "commit (test)").unwrap();
+        let work_commit = head_commit(&clone_path);
+
+        // archive_session should fetch the session branch and clean up the base ref
+        archive_session(&canonical, &clone_path, "archtest01").unwrap();
+
+        // Archive ref should exist and point at the session work
+        let archive_target = resolve_ref(&canonical, &archive_ref_name("archtest01"));
+        assert_eq!(archive_target.as_deref(), Some(work_commit.as_str()));
+
+        // Base ref should be gone
+        assert!(resolve_ref(&canonical, &base_ref_name("archtest01")).is_none());
+    }
+
+    #[test]
+    fn full_round_trip_init_base_branch_archive() {
+        // End-to-end integration canary for the entire merge-back pipeline:
+        // init → record base → branch → commit → archive → verify.
+
+        // 1. Canonical with a file
+        let (_cdir, canonical) = make_canonical("original content");
+
+        // 2. Record base commit (Phase C step 1)
+        let base = record_base_commit(&canonical, "e2e01").unwrap();
+
+        // 3. Simulate a clone (can't use clonefile in tests — use git clone --local)
+        let clone_dir = TempDir::new().unwrap();
+        let clone_path = clone_dir.path().to_path_buf();
+        let mut cmd = git_cmd(None);
+        cmd.arg("clone").arg("--local").arg(&canonical).arg(&clone_path);
+        run_git(cmd, "git clone --local (test)").unwrap();
+
+        // 4. Create session branch in the clone (Phase C step 2)
+        create_session_branch(&clone_path, &base, "e2e01").unwrap();
+
+        // 5. Do session work
+        fs::write(clone_path.join("session-notes.txt"), "important work").unwrap();
+        let mut cmd = git_cmd(Some(&clone_path));
+        cmd.arg("add").arg("-A");
+        run_git(cmd, "add session work (test)").unwrap();
+        let mut cmd = git_cmd(Some(&clone_path));
+        cmd.arg("commit").arg("--no-verify").arg("-m").arg("session work");
+        run_git(cmd, "commit session work (test)").unwrap();
+        let session_head = head_commit(&clone_path);
+
+        // 6. Archive (Phase D) — fetch + delete base ref
+        archive_session(&canonical, &clone_path, "e2e01").unwrap();
+
+        // 7. Verify: archive ref exists and points at session work
+        let archive = resolve_ref(&canonical, &archive_ref_name("e2e01"));
+        assert_eq!(archive.as_deref(), Some(session_head.as_str()));
+
+        // 8. Verify: base ref cleaned up
+        assert!(resolve_ref(&canonical, &base_ref_name("e2e01")).is_none());
+
+        // 9. Verify: session work file is reachable from canonical
+        let mut cmd = git_cmd(Some(&canonical));
+        cmd.arg("cat-file").arg("-e").arg(format!("{session_head}:session-notes.txt"));
+        run_git(cmd, "cat-file session-notes (test)").unwrap();
+
+        // 10. Verify: current_branch + session_id_from_branch work on the clone
+        let branch = current_branch(&clone_path).unwrap();
+        assert_eq!(session_id_from_branch(&branch), Some("e2e01"));
+    }
 }
