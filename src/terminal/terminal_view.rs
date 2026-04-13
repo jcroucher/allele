@@ -246,6 +246,37 @@ impl TerminalView {
                             }
                         }
 
+                        // Prevent stale scrollback from TUI full re-renders.
+                        // CC's ink re-renders the full conversation in normal
+                        // screen mode (no alt screen). Each re-render overflows
+                        // past screen bottom, pushing lines into scrollback.
+                        // Old scrollback from previous renders is stale — the
+                        // visible screen always has the canonical content.
+                        //
+                        // Strategy: when the user is at the bottom (display_offset
+                        // == 0, i.e. not scrolled up) and scrollback exceeds 3×
+                        // screen_lines, clear all scrollback. This prevents
+                        // unbounded duplicate accumulation from repeated TUI
+                        // re-renders. When the user IS scrolled up, leave history
+                        // alone so their view isn't disrupted.
+                        if pty_events && !resize_committed {
+                            if let Some(ref terminal) = this.terminal {
+                                let mut term = terminal.term.lock();
+                                let screen = term.grid().screen_lines();
+                                let offset = term.grid().display_offset();
+                                let history = term.grid().total_lines().saturating_sub(screen);
+
+                                if offset == 0 && history > screen * 3 {
+                                    eprintln!(
+                                        "[SCROLLBACK-TRIM] history={} exceeds {}×3 screen — clearing",
+                                        history, screen,
+                                    );
+                                    term.grid_mut().clear_history();
+                                }
+                                drop(term);
+                            }
+                        }
+
                         // Scrollbar fade: fade in on scroll, fade out after 1.5s
                         let scroll_age = now.duration_since(this.last_scroll_time).as_secs_f32();
                         let target_opacity = if this.scrollbar_dragging || scroll_age < 1.5 {
