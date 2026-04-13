@@ -100,6 +100,105 @@ pub fn is_working_tree_dirty(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Return true if the repo has a remote with the given name (e.g. `"origin"`).
+pub fn has_remote(repo: &Path, name: &str) -> bool {
+    if !is_git_repo(repo) {
+        return false;
+    }
+    let mut cmd = git_cmd(Some(repo));
+    cmd.arg("remote");
+    match cmd.output() {
+        Ok(o) if o.status.success() => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            stdout.lines().any(|line| line.trim() == name)
+        }
+        _ => false,
+    }
+}
+
+/// Detect the default branch name for a remote (e.g. `main` or `master`).
+/// Checks `refs/remotes/<remote>/HEAD` first; falls back to `"master"`.
+pub fn remote_default_branch(repo: &Path, remote: &str) -> String {
+    if !is_git_repo(repo) {
+        return "master".to_string();
+    }
+    let mut cmd = git_cmd(Some(repo));
+    cmd.arg("symbolic-ref")
+        .arg(format!("refs/remotes/{remote}/HEAD"));
+    match cmd.output() {
+        Ok(o) if o.status.success() => {
+            let full = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            // e.g. "refs/remotes/origin/main" → "main"
+            full.rsplit('/').next().unwrap_or("master").to_string()
+        }
+        _ => "master".to_string(),
+    }
+}
+
+/// Fetch the remote's default branch and rebase the current branch onto it.
+///
+/// Steps:
+/// 1. Detect remote default branch (main/master)
+/// 2. `git fetch <remote> <branch>`
+/// 3. `git rebase <remote>/<branch>`
+///
+/// If the rebase encounters conflicts, it is automatically aborted and the
+/// error is propagated — the caller should surface this to the user.
+///
+/// Returns `Ok(true)` if the rebase made changes, `Ok(false)` if already
+/// up to date (no rebase needed).
+pub fn fetch_and_rebase_onto_remote(
+    repo: &Path,
+    remote: &str,
+) -> anyhow::Result<bool> {
+    if !is_git_repo(repo) {
+        anyhow::bail!(
+            "fetch_and_rebase_onto_remote: not a git repo: {}",
+            repo.display()
+        );
+    }
+
+    let branch = remote_default_branch(repo, remote);
+
+    // Record HEAD before to detect if rebase changed anything.
+    let head_before = {
+        let mut cmd = git_cmd(Some(repo));
+        cmd.arg("rev-parse").arg("HEAD");
+        run_git_stdout(cmd, "rev-parse HEAD (pre-rebase)")?
+    };
+
+    // 1. Fetch the remote branch
+    let mut cmd = git_cmd(Some(repo));
+    cmd.arg("fetch").arg(remote).arg(&branch);
+    run_git(cmd, &format!("fetch {remote} {branch}"))?;
+
+    // 2. Rebase onto the fetched remote branch
+    let rebase_ref = format!("{remote}/{branch}");
+    let mut cmd = git_cmd(Some(repo));
+    cmd.arg("rebase").arg(&rebase_ref);
+    let rebase_result = run_git(cmd, &format!("rebase {rebase_ref}"));
+
+    if let Err(e) = rebase_result {
+        // Abort the in-progress rebase to leave the repo in a clean state.
+        let mut abort_cmd = git_cmd(Some(repo));
+        abort_cmd.arg("rebase").arg("--abort");
+        let _ = run_git(abort_cmd, "rebase --abort");
+
+        anyhow::bail!(
+            "Rebase onto {rebase_ref} failed (conflicts likely). \
+             Rebase has been aborted, repo is unchanged. Error: {e}"
+        );
+    }
+
+    let head_after = {
+        let mut cmd = git_cmd(Some(repo));
+        cmd.arg("rev-parse").arg("HEAD");
+        run_git_stdout(cmd, "rev-parse HEAD (post-rebase)")?
+    };
+
+    Ok(head_before != head_after)
+}
+
 /// Initialise `path` as a git repository and create an initial commit
 /// capturing the current on-disk state.
 ///
