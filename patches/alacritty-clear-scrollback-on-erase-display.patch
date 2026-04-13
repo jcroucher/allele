@@ -1,0 +1,47 @@
+From: Patrick D'Orival <patrickdorival@studio.local>
+Subject: Clear scrollback on CSI 2J (erase display) in normal screen mode
+
+When a TUI app (e.g., ink/Claude Code) renders in normal screen mode
+and issues CSI 2J to repaint the full screen, old scrollback from
+previous renders persists — creating duplicate content when scrolling up.
+
+The existing clear_viewport() pushes current visible content into
+scrollback before clearing, which compounds the duplication.
+
+Replace clear_viewport() with clear_history() + reset_region() for
+normal screen mode. This clears both scrollback and visible area
+without pushing stale content into history, giving the app a blank
+canvas identical to what grid.reset() provides on resize.
+
+Alt screen mode is unchanged (already uses reset_region directly).
+
+---
+ alacritty_terminal/src/term/mod.rs | 13 ++++++-------
+ 1 file changed, 6 insertions(+), 7 deletions(-)
+
+diff --git a/alacritty_terminal/src/term/mod.rs b/alacritty_terminal/src/term/mod.rs
+--- a/alacritty_terminal/src/term/mod.rs
++++ b/alacritty_terminal/src/term/mod.rs
+@@ -1788,14 +1788,13 @@
+             ansi::ClearMode::All => {
+                 if self.mode.contains(TermMode::ALT_SCREEN) {
+                     self.grid.reset_region(..);
+                 } else {
+-                    let old_offset = self.grid.display_offset();
+-
+-                    self.grid.clear_viewport();
+-
+-                    // Compute number of lines scrolled by clearing the viewport.
+-                    let lines = self.grid.display_offset().saturating_sub(old_offset);
+-
+-                    self.vi_mode_cursor.point.line =
+-                        (self.vi_mode_cursor.point.line - lines).grid_clamp(self, Boundary::Grid);
++                    // Clear scrollback and visible area without pushing stale
++                    // content into history. Normal-screen TUI apps (e.g., ink)
++                    // repaint everything after CSI 2J — old scrollback is
++                    // duplicate content from previous renders.
++                    self.grid.clear_history();
++                    self.grid.reset_region(..);
+                 }
+
+                 self.selection = None;
