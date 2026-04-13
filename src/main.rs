@@ -2471,6 +2471,8 @@ impl Render for AppState {
                 // Right-hand content column: main terminal + optional drawer
                 let mut content_col = div()
                     .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
                     .h_full()
                     .flex()
                     .flex_col();
