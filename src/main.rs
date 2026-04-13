@@ -491,6 +491,23 @@ impl AppState {
         use hooks::HookKind;
         use session::SessionStatus;
 
+        // --- Auto-naming: capture data independently of status transitions ---
+        // New sessions start as Running and UserPromptSubmit also maps to
+        // Running, so the status guard below would block auto-naming from
+        // ever being reached. Capture the data here (while we hold the
+        // session borrow) and trigger after the borrow is released.
+        let auto_name_data = if event.kind == HookKind::UserPromptSubmit {
+            let is_placeholder = session.label.starts_with("Claude ")
+                || session.label.starts_with("Shell ");
+            if is_placeholder {
+                Some((session.id.clone(), session.clone_path.clone()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let new_status = match event.kind {
             HookKind::Notification => Some(SessionStatus::AwaitingInput),
             HookKind::Stop => Some(SessionStatus::ResponseReady),
@@ -508,23 +525,26 @@ impl AppState {
             HookKind::Other => None,
         };
 
-        let Some(new_status) = new_status else { return };
-        if new_status == prior { return; }
+        let Some(new_status) = new_status else {
+            // No status change, but still trigger auto-naming if applicable.
+            if let Some((session_id, clone_path)) = auto_name_data {
+                eprintln!("auto-naming: trigger fired for session {session_id}");
+                let claude_path = self.claude_path.clone();
+                self.trigger_auto_naming(session_id, clone_path, claude_path, cx);
+            }
+            return;
+        };
+        if new_status == prior {
+            // No status transition, but still trigger auto-naming if applicable.
+            if let Some((session_id, clone_path)) = auto_name_data {
+                eprintln!("auto-naming: trigger fired for session {session_id}");
+                let claude_path = self.claude_path.clone();
+                self.trigger_auto_naming(session_id, clone_path, claude_path, cx);
+            }
+            return;
+        }
 
         session.status = new_status;
-
-        // --- Auto-naming: gather data while we still hold the session borrow ---
-        let auto_name_data = if event.kind == HookKind::UserPromptSubmit {
-            let is_placeholder = session.label.starts_with("Claude ")
-                || session.label.starts_with("Shell ");
-            if is_placeholder {
-                Some((session.id.clone(), session.clone_path.clone()))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
 
         // Capture the label for notifications BEFORE we drop the borrow.
         let session_label = session.label.clone();
