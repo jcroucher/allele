@@ -8,8 +8,8 @@ description = "Claude Code session manager — APFS clone management for paralle
 # GPUI — pinned to specific Zed commit (same rev Termy uses, known working)
 gpui = { git = "https://github.com/zed-industries/zed", rev = "83de8a25e0ef71a8d762a148459bc863adaeb7e3", package = "gpui" }
 
-# Terminal emulation — pinned to specific Alacritty commit
-alacritty_terminal = { git = "https://github.com/alacritty/alacritty", rev = "4225cea231432fb23442b1da2463b4ec9dfd726c" }
+# Terminal emulation — Deverge fork with CSI 2J scrollback fix
+alacritty_terminal = { git = "https://github.com/devergehq/alacritty.git", branch = "allele/clear-scrollback-on-csi2j" }
 
 # Event channels (PTY ↔ UI)
 flume = "0.11"
