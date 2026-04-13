@@ -1,19 +1,22 @@
 mod terminal;
 mod sidebar;
 mod clone;
+mod git;
 mod hooks;
 mod project;
 mod session;
 mod settings;
 mod state;
+mod trust;
 
 use gpui::*;
 use project::Project;
 use session::{Session, SessionStatus};
 use settings::{ProjectSave, Settings};
-use state::{PersistedSession, PersistedState};
+use state::{ArchivedSession, PersistedSession, PersistedState};
 use terminal::{ShellCommand, TerminalEvent, TerminalView};
 use terminal::pty_terminal::PtyTerminal;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug)]
@@ -33,6 +36,20 @@ enum PendingAction {
     /// Permanently delete the clone and remove the session from state.
     DiscardSession { project_idx: usize, session_idx: usize },
     SelectSession { project_idx: usize, session_idx: usize },
+    /// Merge an archived session ref into canonical's working tree.
+    MergeArchive { project_idx: usize, archive_idx: usize },
+    /// Delete an archive ref without merging.
+    DeleteArchive { project_idx: usize, archive_idx: usize },
+    /// Toggle the bottom drawer terminal panel.
+    ToggleDrawer,
+    /// Source path missing — open folder picker so the user can relocate.
+    RelocateProject(usize),
+    /// Canonical has uncommitted changes — confirm before creating a session.
+    ConfirmDirtySession(usize),
+    /// Proceed with session creation despite dirty canonical.
+    ProceedDirtySession(usize),
+    /// Cancel dirty-state session creation.
+    CancelDirtySession,
 }
 
 /// Position of a session in the project tree.
@@ -54,6 +71,8 @@ struct AppState {
     /// the sidebar row at that cursor shows a confirm/cancel prompt instead
     /// of the usual buttons.
     confirming_discard: Option<SessionCursor>,
+    /// Project index awaiting dirty-state confirmation before session create.
+    confirming_dirty_session: Option<usize>,
     /// Absolute path to the Allele hooks.json, passed to claude via
     /// `--settings <path>` at every spawn. `None` if install_if_missing
     /// failed — in that case hooks are silently disabled and the app still
@@ -61,10 +80,15 @@ struct AppState {
     hooks_settings_path: Option<PathBuf>,
     /// Current user settings (sound/notification preferences).
     user_settings: Settings,
+    // Drawer terminal state
+    drawer_visible: bool,
+    drawer_height: f32,
+    drawer_resizing: bool,
 }
 
 const SIDEBAR_MIN_WIDTH: f32 = 160.0;
 const SIDEBAR_DEFAULT_WIDTH: f32 = 240.0;
+const DRAWER_MIN_HEIGHT: f32 = 100.0;
 
 impl AppState {
     /// Get the currently active session, if any.
@@ -93,6 +117,8 @@ impl AppState {
                 name: p.name.clone(),
                 source_path: p.source_path.clone(),
             }).collect(),
+            drawer_height: self.drawer_height,
+            drawer_visible: self.drawer_visible,
             ..self.user_settings.clone()
         };
         settings.save();
@@ -110,6 +136,9 @@ impl AppState {
                     .sessions
                     .push(PersistedSession::from_session(session, &project.id));
             }
+            persisted
+                .archived_sessions
+                .extend(project.archives.iter().cloned());
         }
         if let Err(e) = persisted.save() {
             eprintln!("Failed to save state.json: {e}");
@@ -140,8 +169,23 @@ impl AppState {
 
     /// Create a new project from a source path. Does NOT auto-create a session.
     /// Returns the index of the new project.
+    ///
+    /// This is the sole user-triggered project-add path — rehydration from
+    /// saved settings bypasses it and goes straight through `Project::new`,
+    /// so the silent `git_init` below only runs on genuinely new adds.
     fn create_project(&mut self, source_path: PathBuf, cx: &mut Context<Self>) -> usize {
         let name = Project::name_from_path(&source_path);
+
+        // Phase B: ensure the project is a git repo so session clones have
+        // a base to anchor against. `git_init` is idempotent — a no-op on
+        // existing repos — and non-fatal on failure.
+        if let Err(e) = git::git_init(&source_path) {
+            eprintln!(
+                "git_init: {} failed: {e} (continuing without git integration)",
+                source_path.display()
+            );
+        }
+
         let project = Project::new(name, source_path);
         self.projects.push(project);
         let idx = self.projects.len() - 1;
@@ -160,6 +204,30 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let Some(project) = self.projects.get_mut(project_idx) else { return; };
+
+        // Guard: if the source directory no longer exists (e.g. repo was
+        // moved), prompt the user to relocate rather than failing mid-clone.
+        if !project.source_path.exists() {
+            eprintln!(
+                "Project source path missing: {} — prompting for relocation",
+                project.source_path.display()
+            );
+            self.pending_action = Some(PendingAction::RelocateProject(project_idx));
+            cx.notify();
+            return;
+        }
+
+        // If the working tree has uncommitted changes, prompt the user
+        // before creating a session. The user can choose to proceed (the
+        // dirty state will be present in the clone) or cancel to clean up.
+        if git::is_working_tree_dirty(&project.source_path) && self.confirming_dirty_session.is_none() {
+            self.confirming_dirty_session = Some(project_idx);
+            cx.notify();
+            return;
+        }
+        // Clear any prior dirty confirmation (user chose to proceed).
+        self.confirming_dirty_session = None;
+
         let source_path = project.source_path.clone();
         let project_name = project.name.clone();
         let session_count = project.sessions.len() + project.loading_sessions.len() + 1;
@@ -212,17 +280,19 @@ impl AppState {
         let display_label_for_task = display_label.clone();
 
         cx.spawn_in(window, async move |this, cx| {
-            // Run the clonefile() syscall on the background executor
             let clone_result = cx
                 .background_executor()
                 .spawn(async move {
-                    clone::create_session_clone(&source_for_task, &project_name_for_task, &session_id_for_clone)
+                    clone::create_session_clone(
+                        &source_for_task,
+                        &project_name_for_task,
+                        &session_id_for_clone,
+                    )
                 })
                 .await;
 
             // Back on the main thread with window access
             let _ = this.update_in(cx, move |this: &mut Self, window, cx| {
-                // Resolve clone path (or fall back to source on failure)
                 let clone_path = match clone_result {
                     Ok(p) => {
                         eprintln!("Created APFS clone at: {}", p.display());
@@ -234,15 +304,30 @@ impl AppState {
                     }
                 };
 
+                let clone_succeeded = clone_path != source_path;
+
                 // Find the project again (indices may have shifted if user removed projects)
                 let Some(project) = this.projects.get_mut(project_idx) else {
-                    // Project was removed while we were cloning — clean up the clone
                     let _ = clone::delete_clone(&clone_path);
                     return;
                 };
 
                 // Remove the loading placeholder
                 project.loading_sessions.retain(|l| l.id != session_id);
+
+                // Create the session branch in the clone rooted at HEAD.
+                // Only do this when clonefile succeeded — when we fell back
+                // to source_path we must NOT mutate canonical's HEAD.
+                if clone_succeeded {
+                    if let Err(e) = git::create_session_branch(
+                        &clone_path,
+                        &session_id_for_session,
+                    ) {
+                        eprintln!(
+                            "create_session_branch failed for {session_id_for_session}: {e}"
+                        );
+                    }
+                }
 
                 // Create the terminal view with the clone as PWD
                 let terminal_view = cx.new(|cx| {
@@ -281,6 +366,10 @@ impl AppState {
                         TerminalEvent::NextSession => {
                             this.navigate_session(1, cx);
                         }
+                        TerminalEvent::ToggleDrawer => {
+                            this.pending_action = Some(PendingAction::ToggleDrawer);
+                            cx.notify();
+                        }
                     }
                 }).detach();
 
@@ -317,9 +406,10 @@ impl AppState {
         let Some(project) = self.projects.get_mut(cursor.project_idx) else { return; };
         let Some(session) = project.sessions.get_mut(cursor.session_idx) else { return; };
 
-        // Drop the terminal_view — Drop impl on PtyTerminal sends Msg::Shutdown,
-        // killing the subprocess. The clone on disk is untouched.
+        // Drop the terminal_view and drawer — Drop impl on PtyTerminal sends
+        // Msg::Shutdown, killing the subprocesses. The clone on disk is untouched.
         session.terminal_view = None;
+        session.drawer_terminal = None;
         session.status = SessionStatus::Suspended;
         session.last_active = std::time::SystemTime::now();
 
@@ -399,6 +489,19 @@ impl AppState {
 
         session.status = new_status;
 
+        // --- Auto-naming: gather data while we still hold the session borrow ---
+        let auto_name_data = if event.kind == HookKind::UserPromptSubmit {
+            let is_placeholder = session.label.starts_with("Claude ")
+                || session.label.starts_with("Shell ");
+            if is_placeholder {
+                Some((session.id.clone(), session.clone_path.clone()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Capture the label for notifications BEFORE we drop the borrow.
         let session_label = session.label.clone();
         let project_name = self
@@ -449,6 +552,154 @@ impl AppState {
         }
 
         cx.notify();
+
+        // Trigger auto-naming after all borrows are released.
+        if let Some((session_id, clone_path)) = auto_name_data {
+            let claude_path = self.claude_path.clone();
+            self.trigger_auto_naming(session_id, clone_path, claude_path, cx);
+        }
+    }
+
+    /// Spawn a background task that reads the first prompt from the hook
+    /// events directory, calls `claude -p --model haiku --bare` to summarise
+    /// it into a 3-5 word slug, then updates the session label and renames
+    /// the git branch. No-ops silently on any failure.
+    fn trigger_auto_naming(
+        &self,
+        session_id: String,
+        clone_path: Option<PathBuf>,
+        claude_path: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(claude_bin) = claude_path else { return; };
+        let Some(events_dir) = hooks::events_dir() else { return; };
+
+        cx.spawn(async move |this, cx| {
+            // Read the .prompt file (written by the hook receiver).
+            // Retry a few times with short delays — the hook script runs
+            // asynchronously and the file may not exist yet.
+            let prompt_path = events_dir.join(format!("{session_id}.prompt"));
+            let mut prompt_text = None;
+            for _ in 0..6 {
+                if let Ok(text) = std::fs::read_to_string(&prompt_path) {
+                    if !text.trim().is_empty() {
+                        prompt_text = Some(text);
+                        break;
+                    }
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+            }
+
+            let Some(prompt) = prompt_text else {
+                eprintln!("auto-naming: no prompt file for {session_id}");
+                return;
+            };
+
+            // Truncate prompt to first 200 chars to keep the LLM call cheap.
+            let truncated: String = prompt.chars().take(200).collect();
+
+            // Call claude to summarise.
+            let summary_prompt = format!(
+                "Summarise this user request in exactly 3-5 lowercase words separated by hyphens, \
+                 suitable as a git branch name. Output ONLY the slug, nothing else.\n\n\
+                 Request: {truncated}"
+            );
+
+            // Spawn via login shell so the subprocess inherits the user's
+            // full environment (PATH, auth tokens, etc.). A bare
+            // std::process::Command inherits Allele's .app bundle env which
+            // is too stripped-down for `claude` to authenticate.
+            let escaped_prompt = summary_prompt.replace('\'', "'\\''");
+            let result = cx.background_executor().spawn(async move {
+                std::process::Command::new("/bin/bash")
+                    .arg("-lc")
+                    .arg(format!(
+                        "exec '{}' -p --model haiku --bare '{}'",
+                        claude_bin.replace('\'', "'\\''"),
+                        escaped_prompt,
+                    ))
+                    .output()
+            }).await;
+
+            let slug_raw = match result {
+                Ok(output) if output.status.success() => {
+                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                }
+                Ok(output) => {
+                    eprintln!(
+                        "auto-naming: claude summarise failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("auto-naming: failed to spawn claude: {e}");
+                    return;
+                }
+            };
+
+            if slug_raw.is_empty() {
+                eprintln!("auto-naming: empty slug from claude");
+                return;
+            }
+
+            let slug = git::slugify(&slug_raw, 50);
+            if slug.is_empty() {
+                return;
+            }
+
+            // Human-readable label: replace hyphens with spaces, title case,
+            // capped at 40 chars for sidebar display.
+            let full_label: String = slug
+                .split('-')
+                .map(|word| {
+                    let mut chars = word.chars();
+                    match chars.next() {
+                        Some(c) => {
+                            let upper: String = c.to_uppercase().collect();
+                            format!("{upper}{}", chars.as_str())
+                        }
+                        None => String::new(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let display_label = if full_label.len() > 40 {
+                let mut truncated = full_label[..40].to_string();
+                // Avoid cutting mid-word — trim back to last space.
+                if let Some(last_space) = truncated.rfind(' ') {
+                    truncated.truncate(last_space);
+                }
+                truncated
+            } else {
+                full_label
+            };
+
+            // Rename the git branch in the background (non-blocking).
+            if let Some(ref cp) = clone_path {
+                if let Err(e) = git::rename_session_branch(cp, &session_id, &slug) {
+                    eprintln!("auto-naming: branch rename failed: {e}");
+                    // Continue — label update is still valuable
+                }
+            }
+
+            // Update session label on the main thread.
+            let _ = this.update(cx, |this: &mut AppState, cx| {
+                for project in &mut this.projects {
+                    for session in &mut project.sessions {
+                        if session.id == session_id {
+                            session.label = display_label.clone();
+                            break;
+                        }
+                    }
+                }
+                this.save_state();
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Cycle the active session pointer across all non-Suspended sessions
@@ -592,6 +843,10 @@ impl AppState {
                 TerminalEvent::NextSession => {
                     this.navigate_session(1, cx);
                 }
+                TerminalEvent::ToggleDrawer => {
+                    this.pending_action = Some(PendingAction::ToggleDrawer);
+                    cx.notify();
+                }
             }
         }).detach();
 
@@ -631,18 +886,35 @@ impl AppState {
         let removed = project.sessions.remove(cursor.session_idx);
         let clone_path = removed.clone_path.clone();
         let removed_label = removed.label.clone();
+        // Captured before drop(removed) / end of &mut project borrow.
+        let canonical_for_task = project.source_path.clone();
+        let session_id_for_task = removed.id.clone();
+
+        // Preserve the session's metadata in the archive list so the
+        // sidebar archive browser can show a human-readable label.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        project.archives.push(ArchivedSession {
+            id: removed.id.clone(),
+            project_id: project.id.clone(),
+            label: removed_label.clone(),
+            archived_at: now,
+        });
+
         // Drop the Session — this frees the terminal_view entity (if any),
         // which in turn kills the PTY via the Drop impl on PtyTerminal.
         // Suspended sessions have `terminal_view = None` so there's no PTY
         // to kill; only the clone needs cleanup.
         drop(removed);
 
-        // Show a "Deleting…" placeholder if there's a clone to clean up
+        // Show an "Archiving…" placeholder if there's a clone to clean up
         let placeholder_id = uuid::Uuid::new_v4().to_string();
         if clone_path.is_some() {
             project.loading_sessions.push(project::LoadingSession {
                 id: placeholder_id.clone(),
-                label: format!("{removed_label} (deleting)"),
+                label: format!("{removed_label} (archiving)"),
             });
         }
 
@@ -678,14 +950,38 @@ impl AppState {
         self.save_state();
         cx.notify();
 
-        // Spawn the filesystem cleanup on a background task
+        // Spawn the archive-then-delete pipeline on a background task
         if let Some(clone_path) = clone_path {
             let project_idx = cursor.project_idx;
             let placeholder_id_for_task = placeholder_id.clone();
             cx.spawn(async move |this, cx| {
                 let delete_result = cx
                     .background_executor()
-                    .spawn(async move { clone::delete_clone(&clone_path) })
+                    .spawn(async move {
+                        // Degenerate case: if the session's "clone path"
+                        // is canonical itself (Phase C fallback when the
+                        // clonefile syscall failed), skip the archive
+                        // pipeline — no session branch exists, the fetch
+                        // would be a no-op self-fetch, and delete_clone
+                        // will bail on the workspace-dir safety check.
+                        if clone_path == canonical_for_task {
+                            return clone::delete_clone(&clone_path);
+                        }
+                        // Archive the session's work into canonical
+                        // before the clone dir is removed. Order is
+                        // load-bearing — archive_session must run while
+                        // the clone still exists.
+                        if let Err(e) = git::archive_session(
+                            &canonical_for_task,
+                            &clone_path,
+                            &session_id_for_task,
+                        ) {
+                            eprintln!(
+                                "archive_session failed for {session_id_for_task}: {e}"
+                            );
+                        }
+                        clone::delete_clone(&clone_path)
+                    })
                     .await;
 
                 if let Err(e) = delete_result {
@@ -813,6 +1109,17 @@ fn install_panic_hook() {
 
 fn main() {
     install_panic_hook();
+
+    // Hard dependency check: Allele treats git as non-optional. Fail
+    // loudly before any window opens if it's missing.
+    if !git::git_available() {
+        const MSG: &str = "Allele requires git but none was found on PATH.\n\n\
+                           Install the Xcode Command Line Tools with:\n\n    xcode-select --install";
+        eprintln!("{MSG}");
+        hooks::show_fatal_dialog("Allele", MSG);
+        std::process::exit(1);
+    }
+
     let application = Application::new();
 
     application.run(move |cx: &mut App| {
@@ -853,9 +1160,16 @@ fn main() {
         // Conservative orphan sweep: move any on-disk clone not referenced by
         // the loaded state into ~/.allele/trash/, then purge trash
         // entries older than TRASH_TTL_DAYS. This runs before the window
-        // opens so the user never sees stale placeholders.
+        // opens so the user never sees stale placeholders. The project
+        // sources map lets sweep_orphans archive orphan session work into
+        // canonical before trashing.
         let referenced = state::referenced_clone_paths(&loaded_state);
-        match clone::sweep_orphans(&referenced) {
+        let project_sources: HashMap<String, PathBuf> = loaded_settings
+            .projects
+            .iter()
+            .map(|p| (p.name.clone(), p.source_path.clone()))
+            .collect();
+        match clone::sweep_orphans(&referenced, &project_sources) {
             Ok(0) => {}
             Ok(n) => eprintln!("Orphan sweep trashed {n} unreferenced clone(s)"),
             Err(e) => eprintln!("Orphan sweep failed: {e}"),
@@ -864,6 +1178,17 @@ fn main() {
             Ok(0) => {}
             Ok(n) => eprintln!("Trash purge removed {n} expired entry/entries"),
             Err(e) => eprintln!("Trash purge failed: {e}"),
+        }
+
+        // Prune archive refs older than the trash TTL so they don't
+        // accumulate indefinitely in canonical repos.
+        for p in &loaded_settings.projects {
+            if let Err(e) = git::prune_archive_refs(&p.source_path, clone::TRASH_TTL_DAYS) {
+                eprintln!(
+                    "prune_archive_refs failed for {}: {e}",
+                    p.source_path.display()
+                );
+            }
         }
 
         let claude_path = PtyTerminal::find_claude()
@@ -932,6 +1257,35 @@ fn main() {
                         proj.id = p.id.clone();
                         proj
                     }).collect();
+
+                    // Rehydrate archived sessions from state.json so the
+                    // archive browser shows human-readable labels.
+                    for archived in &loaded_state_for_window.archived_sessions {
+                        if let Some(project) = projects.iter_mut().find(|p| p.id == archived.project_id) {
+                            project.archives.push(archived.clone());
+                        }
+                    }
+
+                    // Reconcile: any git archive refs without a state.json
+                    // entry (e.g., sessions archived before this change
+                    // landed) get a synthetic entry with the session ID as
+                    // the label so they still appear in the browser.
+                    for project in &mut projects {
+                        let known_ids: std::collections::HashSet<String> =
+                            project.archives.iter().map(|a| a.id.clone()).collect();
+                        if let Ok(git_entries) = git::list_archive_refs(&project.source_path) {
+                            for entry in git_entries {
+                                if !known_ids.contains(&entry.session_id) {
+                                    project.archives.push(ArchivedSession {
+                                        id: entry.session_id.clone(),
+                                        project_id: project.id.clone(),
+                                        label: format!("Session {}", &entry.session_id[..8.min(entry.session_id.len())]),
+                                        archived_at: entry.timestamp,
+                                    });
+                                }
+                            }
+                        }
+                    }
 
                     // Rehydrate sessions from state.json as Suspended entries
                     // (no PTY, ⏸ icon). They show up in the sidebar immediately
@@ -1004,7 +1358,12 @@ fn main() {
                             .max(SIDEBAR_MIN_WIDTH),
                         sidebar_resizing: false,
                         confirming_discard: None,
+                        confirming_dirty_session: None,
                         hooks_settings_path: hooks_settings_path_for_window,
+                        drawer_visible: settings_for_window.drawer_visible,
+                        drawer_height: settings_for_window.drawer_height
+                            .max(DRAWER_MIN_HEIGHT),
+                        drawer_resizing: false,
                         user_settings: settings_for_window.clone(),
                     }
                 })
@@ -1018,6 +1377,7 @@ impl Render for AppState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Process pending actions
         if let Some(action) = self.pending_action.take() {
+            let mut skip_refocus = false;
             match action {
                 PendingAction::NewSessionInActiveProject => {
                     if let Some(active) = self.active {
@@ -1075,6 +1435,55 @@ impl Render for AppState {
                         cx,
                     );
                 }
+                PendingAction::MergeArchive { project_idx, archive_idx } => {
+                    if let Some(project) = self.projects.get_mut(project_idx) {
+                        if let Some(entry) = project.archives.get(archive_idx) {
+                            let session_id = entry.id.clone();
+                            match git::merge_archive(&project.source_path, &session_id) {
+                                Ok(git::MergeResult::Merged) => {
+                                    let _ = git::delete_ref(
+                                        &project.source_path,
+                                        &git::archive_ref_name(&session_id),
+                                    );
+                                    project.archives.remove(archive_idx);
+                                    eprintln!("Merged archive {session_id} into canonical");
+                                }
+                                Ok(git::MergeResult::AlreadyUpToDate) => {
+                                    let _ = git::delete_ref(
+                                        &project.source_path,
+                                        &git::archive_ref_name(&session_id),
+                                    );
+                                    project.archives.remove(archive_idx);
+                                    eprintln!(
+                                        "Archive {session_id} had no new commits — nothing to merge (already up to date)"
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "merge_archive failed for {session_id}: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    self.save_state();
+                    cx.notify();
+                }
+                PendingAction::DeleteArchive { project_idx, archive_idx } => {
+                    if let Some(project) = self.projects.get_mut(project_idx) {
+                        if let Some(entry) = project.archives.get(archive_idx) {
+                            let session_id = entry.id.clone();
+                            let _ = git::delete_ref(
+                                &project.source_path,
+                                &git::archive_ref_name(&session_id),
+                            );
+                            project.archives.remove(archive_idx);
+                            eprintln!("Deleted archive ref for {session_id}");
+                        }
+                    }
+                    self.save_state();
+                    cx.notify();
+                }
                 PendingAction::SelectSession { project_idx, session_idx } => {
                     let cursor = SessionCursor { project_idx, session_idx };
                     // Clicking a Suspended session cold-resumes it; clicking
@@ -1096,6 +1505,120 @@ impl Render for AppState {
                                 fh.focus(window, cx);
                             }
                         }
+                    }
+                }
+                PendingAction::ToggleDrawer => {
+                    skip_refocus = true;
+                    self.drawer_visible = !self.drawer_visible;
+                    if self.drawer_visible {
+                        // Lazily spawn the drawer terminal for the active session
+                        if let Some(cursor) = self.active {
+                            let needs_spawn = self.projects
+                                .get(cursor.project_idx)
+                                .and_then(|p| p.sessions.get(cursor.session_idx))
+                                .map(|s| s.drawer_terminal.is_none())
+                                .unwrap_or(false);
+                            if needs_spawn {
+                                let working_dir = self.projects
+                                    .get(cursor.project_idx)
+                                    .and_then(|p| p.sessions.get(cursor.session_idx))
+                                    .and_then(|s| s.clone_path.clone());
+                                let drawer_tv = cx.new(|cx| {
+                                    TerminalView::new(window, cx, None, working_dir)
+                                });
+                                // Subscribe so Cmd+J from the drawer also toggles
+                                cx.subscribe(&drawer_tv, |this: &mut Self, _tv: Entity<TerminalView>, event: &TerminalEvent, cx: &mut Context<Self>| {
+                                    match event {
+                                        TerminalEvent::ToggleDrawer => {
+                                            this.pending_action = Some(PendingAction::ToggleDrawer);
+                                            cx.notify();
+                                        }
+                                        // Drawer terminal doesn't handle session-management events
+                                        _ => {}
+                                    }
+                                }).detach();
+                                if let Some(session) = self.projects
+                                    .get_mut(cursor.project_idx)
+                                    .and_then(|p| p.sessions.get_mut(cursor.session_idx))
+                                {
+                                    session.drawer_terminal = Some(drawer_tv);
+                                }
+                            }
+                            // Focus the drawer terminal
+                            if let Some(session) = self.projects
+                                .get(cursor.project_idx)
+                                .and_then(|p| p.sessions.get(cursor.session_idx))
+                            {
+                                if let Some(dt) = session.drawer_terminal.as_ref() {
+                                    let fh = dt.read(cx).focus_handle.clone();
+                                    fh.focus(window, cx);
+                                }
+                            }
+                        }
+                    } else {
+                        // Focus back to the main terminal when hiding drawer
+                        if let Some(session) = self.active_session() {
+                            if let Some(tv) = session.terminal_view.as_ref() {
+                                let fh = tv.read(cx).focus_handle.clone();
+                                fh.focus(window, cx);
+                            }
+                        }
+                    }
+                    self.save_settings();
+                }
+                PendingAction::RelocateProject(project_idx) => {
+                    let paths = cx.prompt_for_paths(PathPromptOptions {
+                        files: false,
+                        directories: true,
+                        multiple: false,
+                        prompt: Some("Relocate project folder".into()),
+                    });
+
+                    cx.spawn(async move |this, cx| {
+                        if let Ok(Ok(Some(paths))) = paths.await {
+                            if let Some(new_path) = paths.into_iter().next() {
+                                let _ = this.update(cx, |this: &mut Self, cx| {
+                                    if let Some(project) = this.projects.get_mut(project_idx) {
+                                        eprintln!(
+                                            "Relocated project '{}': {} -> {}",
+                                            project.name,
+                                            project.source_path.display(),
+                                            new_path.display()
+                                        );
+                                        project.source_path = new_path;
+                                        project.name = Project::name_from_path(&project.source_path);
+                                        this.save_settings();
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                        }
+                    })
+                    .detach();
+                }
+                PendingAction::ConfirmDirtySession(project_idx) => {
+                    self.confirming_dirty_session = Some(project_idx);
+                    cx.notify();
+                }
+                PendingAction::ProceedDirtySession(project_idx) => {
+                    // confirming_dirty_session stays Some so
+                    // add_session_to_project skips the dirty check.
+                    self.add_session_to_project(project_idx, window, cx);
+                }
+                PendingAction::CancelDirtySession => {
+                    self.confirming_dirty_session = None;
+                    cx.notify();
+                }
+            }
+
+            // After any sidebar-triggered action, re-focus the active
+            // terminal so keyboard input goes back to Claude Code.
+            // ToggleDrawer manages its own focus, so skip it.
+            if !skip_refocus {
+                if let Some(session) = self.active_session() {
+                    if let Some(tv) = session.terminal_view.as_ref() {
+                        let fh = tv.read(cx).focus_handle.clone();
+                        fh.focus(window, cx);
                     }
                 }
             }
@@ -1202,6 +1725,66 @@ impl Render for AppState {
                     )
                     .into_any_element(),
             );
+
+            // Dirty-state confirmation prompt
+            if self.confirming_dirty_session == Some(p_idx) {
+                sidebar_items.push(
+                    div()
+                        .id(SharedString::from(format!("dirty-confirm-{p_idx}")))
+                        .pl(px(24.0))
+                        .pr(px(12.0))
+                        .py(px(5.0))
+                        .bg(rgb(0x3b2f1e)) // subtle amber tint
+                        .flex()
+                        .flex_row()
+                        .gap(px(8.0))
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(11.0))
+                                .text_color(rgb(0xf9e2af)) // yellow
+                                .child("Uncommitted changes — proceed?"),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("dirty-proceed-{p_idx}")))
+                                .cursor_pointer()
+                                .px(px(6.0))
+                                .py(px(2.0))
+                                .rounded(px(3.0))
+                                .bg(rgb(0xa6e3a1))
+                                .text_size(px(10.0))
+                                .text_color(rgb(0x1e1e2e))
+                                .hover(|s| s.bg(rgb(0x94e2d5)))
+                                .child("Proceed")
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this: &mut Self, _event, _window, cx| {
+                                    cx.stop_propagation();
+                                    this.pending_action = Some(PendingAction::ProceedDirtySession(p_idx));
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("dirty-cancel-{p_idx}")))
+                                .cursor_pointer()
+                                .px(px(6.0))
+                                .py(px(2.0))
+                                .rounded(px(3.0))
+                                .bg(rgb(0x45475a))
+                                .text_size(px(10.0))
+                                .text_color(rgb(0xcdd6f4))
+                                .hover(|s| s.bg(rgb(0x585b70)))
+                                .child("Cancel")
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this: &mut Self, _event, _window, cx| {
+                                    cx.stop_propagation();
+                                    this.pending_action = Some(PendingAction::CancelDirtySession);
+                                    cx.notify();
+                                })),
+                        )
+                        .into_any_element(),
+                );
+            }
 
             // Loading placeholders (sessions mid-clone)
             for loading in &project.loading_sessions {
@@ -1428,6 +2011,127 @@ impl Render for AppState {
 
                 sidebar_items.push(row.into_any_element());
             }
+
+            // Archived sessions for this project
+            if !project.archives.is_empty() {
+                // Section header
+                sidebar_items.push(
+                    div()
+                        .id(SharedString::from(format!("archives-header-{p_idx}")))
+                        .px(px(16.0))
+                        .py(px(4.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_size(px(9.0))
+                                .text_color(rgb(0x585b70))
+                                .child(format!("ARCHIVES ({})", project.archives.len())),
+                        )
+                        .into_any_element(),
+                );
+
+                for (a_idx, archive) in project.archives.iter().enumerate() {
+                    let display_label = archive.label.clone();
+                    let age = {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let delta = now.saturating_sub(archive.archived_at);
+                        if delta < 60 { "just now".to_string() }
+                        else if delta < 3600 { format!("{}m ago", delta / 60) }
+                        else if delta < 86400 { format!("{}h ago", delta / 3600) }
+                        else { format!("{}d ago", delta / 86400) }
+                    };
+
+                    sidebar_items.push(
+                        div()
+                            .id(SharedString::from(format!("archive-{p_idx}-{a_idx}")))
+                            .pl(px(24.0))
+                            .pr(px(12.0))
+                            .py(px(3.0))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_row()
+                                    .gap(px(6.0))
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .text_size(px(10.0))
+                                            .text_color(rgb(0x585b70))
+                                            .child("📦"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.0))
+                                            .text_color(rgb(0x6c7086))
+                                            .child(display_label),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(9.0))
+                                            .text_color(rgb(0x45475a))
+                                            .child(age),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap(px(4.0))
+                                    .child(
+                                        // Merge button
+                                        div()
+                                            .id(SharedString::from(format!("merge-{p_idx}-{a_idx}")))
+                                            .cursor_pointer()
+                                            .px(px(4.0))
+                                            .py(px(1.0))
+                                            .rounded(px(3.0))
+                                            .text_size(px(9.0))
+                                            .text_color(rgb(0xa6e3a1))
+                                            .hover(|s| s.bg(rgb(0x313244)))
+                                            .child("merge")
+                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this: &mut Self, _event, _window, cx| {
+                                                cx.stop_propagation();
+                                                this.pending_action = Some(PendingAction::MergeArchive {
+                                                    project_idx: p_idx,
+                                                    archive_idx: a_idx,
+                                                });
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        // Delete button
+                                        div()
+                                            .id(SharedString::from(format!("delarchive-{p_idx}-{a_idx}")))
+                                            .cursor_pointer()
+                                            .px(px(4.0))
+                                            .text_size(px(10.0))
+                                            .text_color(rgb(0x45475a))
+                                            .hover(|s| s.text_color(rgb(0xf38ba8)))
+                                            .child("×")
+                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this: &mut Self, _event, _window, cx| {
+                                                cx.stop_propagation();
+                                                this.pending_action = Some(PendingAction::DeleteArchive {
+                                                    project_idx: p_idx,
+                                                    archive_idx: a_idx,
+                                                });
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .into_any_element(),
+                    );
+                }
+            }
         }
 
         // Status summary
@@ -1457,6 +2161,7 @@ impl Render for AppState {
 
         let sidebar_w = self.sidebar_width;
         let is_resizing = self.sidebar_resizing;
+        let drawer_is_resizing = self.drawer_resizing;
 
         // Outer non-flex container that hosts the flex row AND the drag overlay.
         // Keeping the overlay OUTSIDE the flex container ensures Taffy's layout
@@ -1571,96 +2276,152 @@ impl Render for AppState {
                     })),
             )
             .child({
-                // Main terminal area with optional "session ended" overlay
-                let mut main_area = div()
+                // Right-hand content column: main terminal + optional drawer
+                let mut content_col = div()
                     .flex_1()
                     .h_full()
-                    .relative();
+                    .flex()
+                    .flex_col();
 
-                if let Some(tv) = self.active_session().and_then(|s| s.terminal_view.clone()) {
-                    main_area = main_area.child(tv);
-                } else {
-                    // Empty-state placeholder
-                    main_area = main_area.child(
-                        div()
-                            .size_full()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .justify_center()
-                            .gap(px(16.0))
-                            .bg(rgb(0x1e1e2e))
-                            .child(
-                                div()
-                                    .text_size(px(16.0))
-                                    .text_color(rgb(0x6c7086))
-                                    .child("No active session"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(0x45475a))
-                                    .child("Click + in the sidebar to open a project"),
-                            ),
-                    );
+                // --- Main terminal area (flex_1, takes remaining space) ---
+                {
+                    let mut main_area = div()
+                        .flex_1()
+                        .min_h(px(100.0))
+                        .relative();
+
+                    if let Some(tv) = self.active_session().and_then(|s| s.terminal_view.clone()) {
+                        main_area = main_area.child(tv);
+                    } else {
+                        // Empty-state placeholder
+                        main_area = main_area.child(
+                            div()
+                                .size_full()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .justify_center()
+                                .gap(px(16.0))
+                                .bg(rgb(0x1e1e2e))
+                                .child(
+                                    div()
+                                        .text_size(px(16.0))
+                                        .text_color(rgb(0x6c7086))
+                                        .child("No active session"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(0x45475a))
+                                        .child("Click + in the sidebar to open a project"),
+                                ),
+                        );
+                    }
+
+                    if active_is_done {
+                        main_area = main_area.child(
+                            // "Session ended" overlay bar at bottom
+                            div()
+                                .absolute()
+                                .bottom(px(0.0))
+                                .left(px(0.0))
+                                .right(px(0.0))
+                                .px(px(16.0))
+                                .py(px(10.0))
+                                .bg(rgb(0x313244))
+                                .border_t_1()
+                                .border_color(rgb(0x45475a))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(0x6c7086))
+                                        .child("Session ended"),
+                                )
+                                .child(
+                                    div()
+                                        .id("restart-btn")
+                                        .cursor_pointer()
+                                        .px(px(10.0))
+                                        .py(px(4.0))
+                                        .rounded(px(4.0))
+                                        .bg(rgb(0x45475a))
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(0xcdd6f4))
+                                        .hover(|s| s.bg(rgb(0x585b70)))
+                                        .child("New Session")
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|this: &mut Self, _event, _window, cx| {
+                                            if let Some(active) = this.active {
+                                                this.pending_action = Some(PendingAction::AddSessionToProject(active.project_idx));
+                                                cx.notify();
+                                            }
+                                        })),
+                                ),
+                        );
+                    }
+
+                    content_col = content_col.child(main_area);
                 }
 
-                if active_is_done {
-                    main_area = main_area.child(
-                        // "Session ended" overlay bar at bottom
+                // --- Drawer terminal (fixed height, shown when drawer_visible) ---
+                let drawer_h = self.drawer_height;
+                if self.drawer_visible {
+                    // Resize handle — 6px tall invisible hover zone above drawer
+                    content_col = content_col.child(
                         div()
-                            .absolute()
-                            .bottom(px(0.0))
-                            .left(px(0.0))
-                            .right(px(0.0))
-                            .px(px(16.0))
-                            .py(px(10.0))
+                            .id("drawer-resize-handle")
+                            .w_full()
+                            .h(px(6.0))
+                            .cursor_row_resize()
                             .bg(rgb(0x313244))
-                            .border_t_1()
-                            .border_color(rgb(0x45475a))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(0x6c7086))
-                                    .child("Session ended"),
-                            )
-                            .child(
-                                div()
-                                    .id("restart-btn")
-                                    .cursor_pointer()
-                                    .px(px(10.0))
-                                    .py(px(4.0))
-                                    .rounded(px(4.0))
-                                    .bg(rgb(0x45475a))
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(0xcdd6f4))
-                                    .hover(|s| s.bg(rgb(0x585b70)))
-                                    .child("New Session")
-                                    .on_mouse_down(MouseButton::Left, cx.listener(|this: &mut Self, _event, _window, cx| {
-                                        if let Some(active) = this.active {
-                                            this.pending_action = Some(PendingAction::AddSessionToProject(active.project_idx));
-                                            cx.notify();
-                                        }
-                                    })),
-                            ),
+                            .hover(|s| s.bg(rgb(0x45475a)))
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this: &mut Self, _event, _window, cx| {
+                                this.drawer_resizing = true;
+                                cx.notify();
+                            })),
                     );
+
+                    // Drawer content
+                    let mut drawer_panel = div()
+                        .w_full()
+                        .h(px(drawer_h))
+                        .flex_shrink_0()
+                        .bg(rgb(0x1e1e2e));
+
+                    if let Some(dt) = self.active_session().and_then(|s| s.drawer_terminal.clone()) {
+                        drawer_panel = drawer_panel.child(dt);
+                    } else {
+                        drawer_panel = drawer_panel.child(
+                            div()
+                                .size_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(11.0))
+                                .text_color(rgb(0x45475a))
+                                .child("Terminal drawer"),
+                        );
+                    }
+                    content_col = content_col.child(drawer_panel);
                 }
 
-                main_area
+                content_col
             });
 
         // Outer wrapper: non-flex, relative-positioned container hosting both
         // the flex row and the optional drag overlay as siblings.
-        div()
+        let mut outer = div()
             .size_full()
             .relative()
-            .child(flex_row)
-            .children(if is_resizing {
-                vec![div()
+            .child(flex_row);
+
+        // Sidebar drag overlay
+        if is_resizing {
+            outer = outer.child(
+                div()
                     .id("sidebar-drag-overlay")
                     .absolute()
                     .top(px(0.0))
@@ -1682,10 +2443,40 @@ impl Render for AppState {
                         this.sidebar_resizing = false;
                         this.save_settings();
                         cx.notify();
+                    })),
+            );
+        }
+
+        // Drawer drag overlay
+        if drawer_is_resizing {
+            outer = outer.child(
+                div()
+                    .id("drawer-drag-overlay")
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .cursor_row_resize()
+                    .on_mouse_move(cx.listener(|this: &mut Self, event: &MouseMoveEvent, window, cx| {
+                        let viewport_h = f32::from(window.viewport_size().height);
+                        let mouse_y = f32::from(event.position.y);
+                        // Drawer height = distance from bottom of viewport to mouse
+                        let new_height = (viewport_h - mouse_y).clamp(DRAWER_MIN_HEIGHT, viewport_h - 200.0);
+                        if (new_height - this.drawer_height).abs() > 0.5 {
+                            this.drawer_height = new_height;
+                            window.refresh();
+                            cx.notify();
+                        }
                     }))
-                    .into_any_element()]
-            } else {
-                vec![]
-            })
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this: &mut Self, _event: &MouseUpEvent, _window, cx| {
+                        this.drawer_resizing = false;
+                        this.save_settings();
+                        cx.notify();
+                    })),
+            );
+        }
+
+        outer
     }
 }

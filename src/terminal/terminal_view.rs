@@ -1,4 +1,5 @@
 use super::grid_element::TerminalGridElement;
+use super::keymap::{self, AppAction, KeymapConfig};
 use super::pty_terminal::{PtyTerminal, ShellCommand, TermSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
@@ -12,6 +13,10 @@ const MIN_FONT_SIZE: f32 = 8.0;
 const MAX_FONT_SIZE: f32 = 32.0;
 const MIN_COLS: u16 = 20;
 const MIN_ROWS: u16 = 4;
+/// Milliseconds the desired terminal size must be stable before we commit
+/// the resize to the PTY (sends SIGWINCH). Prevents rapid size oscillation
+/// from cascading through CC's TUI re-render and duplicating scrollback.
+const RESIZE_DEBOUNCE_MS: u64 = 80;
 
 /// Events emitted by the terminal view to the parent
 #[derive(Debug, Clone)]
@@ -23,6 +28,8 @@ pub enum TerminalEvent {
     PrevSession,
     /// Cycle to the next running session (skips Suspended).
     NextSession,
+    /// Toggle the bottom drawer terminal panel.
+    ToggleDrawer,
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
@@ -38,6 +45,10 @@ pub struct TerminalView {
     cell_width: f32,
     cell_height: f32,
     scroll_dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // Sub-cell pixel remainder for trackpad (ScrollDelta::Pixels) scrolling.
+    // Accumulates fractional deltas across events so small continuous trackpad
+    // input produces fluid scrolling instead of staccato single-line ticks.
+    scroll_pixel_accumulator: std::sync::Arc<std::sync::Mutex<f32>>,
     // Element bounds — written by grid_element during paint, read by mouse handlers.
     // Stored as atomic i32 pixels for lock-free access.
     element_origin_x: std::sync::Arc<std::sync::atomic::AtomicI32>,
@@ -63,12 +74,17 @@ pub struct TerminalView {
     search_current_idx: usize,
     // URL detection
     hovered_url: Option<(usize, usize, usize, String)>, // (row, col_start, col_end, url)
+    // Resize debounce — record desired size + timestamp, only commit
+    // the resize to the PTY once the size has been stable for RESIZE_DEBOUNCE_MS.
+    pending_resize: Option<(TermSize, Instant)>,
     // Bell flash state
     bell_flash_start: Option<Instant>,
     // FPS tracking
     frame_count: u32,
     last_fps_time: Instant,
     pub current_fps: u32,
+    // Keymap
+    keymap: KeymapConfig,
 }
 
 impl TerminalView {
@@ -110,6 +126,7 @@ impl TerminalView {
                     cell_width,
                     cell_height,
                     scroll_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    scroll_pixel_accumulator: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
                     element_origin_x: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0)),
                     element_origin_y: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0)),
                     scrollbar_dragging: false,
@@ -126,10 +143,12 @@ impl TerminalView {
                     search_matches: Vec::new(),
                     search_current_idx: 0,
                     hovered_url: None,
+                    pending_resize: None,
                     bell_flash_start: None,
                     frame_count: 0,
                     last_fps_time: Instant::now(),
                     current_fps: 0,
+                    keymap: KeymapConfig::default(),
                 };
             }
         };
@@ -192,6 +211,41 @@ impl TerminalView {
                             blink_changed = true;
                         }
 
+                        // Commit pending resize if stable for RESIZE_DEBOUNCE_MS.
+                        let mut resize_committed = false;
+                        if let Some((pending_size, recorded_at)) = this.pending_resize {
+                            if recorded_at.elapsed() >= Duration::from_millis(RESIZE_DEBOUNCE_MS) {
+                                eprintln!(
+                                    "[RESIZE-DIAG] COMMIT: {}x{} -> {}x{} | debounce={:.0}ms | {:?}",
+                                    this.last_cols, this.last_rows,
+                                    pending_size.cols, pending_size.rows,
+                                    recorded_at.elapsed().as_millis(),
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_millis())
+                                        .unwrap_or(0),
+                                );
+                                // Reset the entire grid before sending SIGWINCH.
+                                // CC's ink re-renders the full conversation on resize —
+                                // that repaint IS the correct canonical state at the new
+                                // terminal width. clear_history() alone leaves the visible
+                                // grid intact, so the old content persists as a single
+                                // ghost copy when CC repaints on top. reset() clears both
+                                // scrollback AND visible cells, giving CC a blank canvas.
+                                if let Some(ref terminal) = this.terminal {
+                                    terminal.term.lock().grid_mut().reset::<alacritty_terminal::vte::ansi::Color>();
+                                    eprintln!("[RESIZE-DIAG] RESET grid (scrollback + visible) before SIGWINCH");
+                                }
+                                this.last_cols = pending_size.cols;
+                                this.last_rows = pending_size.rows;
+                                if let Some(ref mut terminal) = this.terminal {
+                                    terminal.resize(pending_size);
+                                }
+                                this.pending_resize = None;
+                                resize_committed = true;
+                            }
+                        }
+
                         // Scrollbar fade: fade in on scroll, fade out after 1.5s
                         let scroll_age = now.duration_since(this.last_scroll_time).as_secs_f32();
                         let target_opacity = if this.scrollbar_dragging || scroll_age < 1.5 {
@@ -208,7 +262,7 @@ impl TerminalView {
                             opacity_changed = true;
                         }
 
-                        pty_events || scrolled || blink_changed || opacity_changed || bell || bell_expired
+                        pty_events || scrolled || blink_changed || opacity_changed || bell || bell_expired || resize_committed
                     })
                     .unwrap_or(false);
 
@@ -222,36 +276,11 @@ impl TerminalView {
         })
         .detach();
 
-        // Observe window bounds changes for resize.
-        // Uses the actual terminal element origin (set by grid_element during
-        // paint) when available, falling back to a sensible estimate on first run.
-        cx.observe_window_bounds(window, |this: &mut Self, window, _cx| {
-            let viewport = window.viewport_size();
-            let origin_x = this.element_origin_x.load(std::sync::atomic::Ordering::Relaxed) as f32;
-            let origin_y = this.element_origin_y.load(std::sync::atomic::Ordering::Relaxed) as f32;
-
-            // Use actual origin when painted at least once, else fall back to default
-            let sidebar_estimate = if origin_x > 0.0 { origin_x } else { 240.0 };
-            let available_width = f32::from(viewport.width) - sidebar_estimate;
-            let available_height = f32::from(viewport.height) - origin_y;
-
-            if available_width > 100.0 && available_height > 100.0 {
-                let new_size = Self::compute_size(
-                    available_width,
-                    available_height,
-                    this.cell_width,
-                    this.cell_height,
-                );
-                if new_size.cols != this.last_cols || new_size.rows != this.last_rows {
-                    this.last_cols = new_size.cols;
-                    this.last_rows = new_size.rows;
-                    if let Some(ref mut terminal) = this.terminal {
-                        terminal.resize(new_size);
-                    }
-                }
-            }
-        })
-        .detach();
+        // Resize is handled exclusively in render() using fresh origin
+        // values from the last paint pass. An earlier observe_window_bounds
+        // handler was removed because it raced with render() and used stale
+        // origin values, causing spurious resize oscillation that made CC
+        // re-render its entire TUI and duplicate scrollback content.
 
 
         Self {
@@ -264,6 +293,7 @@ impl TerminalView {
             cell_width,
             cell_height,
             scroll_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            scroll_pixel_accumulator: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
             element_origin_x: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0)),
             element_origin_y: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0)),
             scrollbar_dragging: false,
@@ -280,10 +310,12 @@ impl TerminalView {
             search_matches: Vec::new(),
             search_current_idx: 0,
             hovered_url: None,
+            pending_resize: None,
             bell_flash_start: None,
             frame_count: 0,
             last_fps_time: Instant::now(),
             current_fps: 0,
+            keymap: KeymapConfig::default(),
         }
     }
 
@@ -708,7 +740,9 @@ impl TerminalView {
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Opportunistic PTY resize: if the visible terminal area changed since
-        // last render (e.g. sidebar was dragged), update the PTY size.
+        // last render (e.g. sidebar was dragged), record the desired size.
+        // The actual resize is debounced — committed by the poll loop once
+        // the size has been stable for RESIZE_DEBOUNCE_MS.
         {
             let viewport = window.viewport_size();
             let origin_x = self.element_origin_x.load(std::sync::atomic::Ordering::Relaxed) as f32;
@@ -722,10 +756,29 @@ impl Render for TerminalView {
                         self.cell_width, self.cell_height,
                     );
                     if new_size.cols != self.last_cols || new_size.rows != self.last_rows {
-                        self.last_cols = new_size.cols;
-                        self.last_rows = new_size.rows;
-                        if let Some(ref mut terminal) = self.terminal {
-                            terminal.resize(new_size);
+                        // Check if the pending resize already matches — only
+                        // reset the debounce timer if the desired size changed.
+                        let should_record = match self.pending_resize {
+                            Some((pending, _)) => {
+                                pending.cols != new_size.cols || pending.rows != new_size.rows
+                            }
+                            None => true,
+                        };
+                        if should_record {
+                            eprintln!(
+                                "[RESIZE-DIAG] RECORD: {}x{} -> {}x{} | origin=({:.1},{:.1}) viewport=({:.1},{:.1}) avail=({:.1},{:.1}) cell=({:.1},{:.1}) | {:?}",
+                                self.last_cols, self.last_rows,
+                                new_size.cols, new_size.rows,
+                                origin_x, origin_y,
+                                f32::from(viewport.width), f32::from(viewport.height),
+                                available_width, available_height,
+                                self.cell_width, self.cell_height,
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis())
+                                    .unwrap_or(0),
+                            );
+                            self.pending_resize = Some((new_size, Instant::now()));
                         }
                     }
                 }
@@ -850,15 +903,13 @@ impl Render for TerminalView {
                     return;
                 }
 
-                // Handle Cmd shortcuts (emit to parent)
-                if mods.platform {
-                    match key {
-                        "v" => {
-                            // Cmd+V: paste clipboard contents
+                // ── App-level shortcuts (Cmd key) ─────────────────────
+                if let Some(action) = keymap::app_action(key, mods) {
+                    match action {
+                        AppAction::Paste => {
                             if let Some(ref terminal) = this.terminal {
                                 if let Some(item) = cx.read_from_clipboard() {
                                     if let Some(text) = item.text() {
-                                        // Check if terminal is in bracketed paste mode
                                         let use_bracketed = terminal.term.lock().mode()
                                             .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
                                         if use_bracketed {
@@ -871,65 +922,8 @@ impl Render for TerminalView {
                                     }
                                 }
                             }
-                            return;
                         }
-                        "f" => {
-                            // Cmd+F: open search
-                            this.search_active = true;
-                            this.search_query.clear();
-                            this.search_matches.clear();
-                            this.search_current_idx = 0;
-                            cx.notify();
-                            return;
-                        }
-                        "=" | "+" => {
-                            // Cmd+= / Cmd++: zoom in
-                            let new_size = (this.font_size + 1.0).min(MAX_FONT_SIZE);
-                            if new_size != this.font_size {
-                                this.font_size = new_size;
-                                this.remeasure_cells(window);
-                                cx.notify();
-                            }
-                            return;
-                        }
-                        "-" | "_" => {
-                            // Cmd+-: zoom out
-                            let new_size = (this.font_size - 1.0).max(MIN_FONT_SIZE);
-                            if new_size != this.font_size {
-                                this.font_size = new_size;
-                                this.remeasure_cells(window);
-                                cx.notify();
-                            }
-                            return;
-                        }
-                        "0" => {
-                            // Cmd+0: reset font size
-                            if this.font_size != FONT_SIZE {
-                                this.font_size = FONT_SIZE;
-                                this.remeasure_cells(window);
-                                cx.notify();
-                            }
-                            return;
-                        }
-                        "g" => {
-                            // Cmd+G: next match (Cmd+Shift+G: previous)
-                            if !this.search_matches.is_empty() {
-                                if mods.shift {
-                                    this.search_current_idx = if this.search_current_idx == 0 {
-                                        this.search_matches.len() - 1
-                                    } else {
-                                        this.search_current_idx - 1
-                                    };
-                                } else {
-                                    this.search_current_idx =
-                                        (this.search_current_idx + 1) % this.search_matches.len();
-                                }
-                                cx.notify();
-                            }
-                            return;
-                        }
-                        "c" => {
-                            // Cmd+C: copy selection if any, else send Ctrl+C
+                        AppAction::Copy => {
                             if let Some(text) = this.get_selected_text() {
                                 if !text.is_empty() {
                                     cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -943,32 +937,71 @@ impl Render for TerminalView {
                             if let Some(ref terminal) = this.terminal {
                                 terminal.write(&[0x03]);
                             }
-                            return;
                         }
-                        "backspace" => {
-                            // Cmd+Backspace = macOS "delete to start of line".
-                            // Map to Ctrl+U (0x15), which readline (and
-                            // Claude Code's input editor) treats as
-                            // backward-kill-line.
+                        AppAction::OpenSearch => {
+                            this.search_active = true;
+                            this.search_query.clear();
+                            this.search_matches.clear();
+                            this.search_current_idx = 0;
+                            cx.notify();
+                        }
+                        AppAction::FindNext => {
+                            if !this.search_matches.is_empty() {
+                                this.search_current_idx =
+                                    (this.search_current_idx + 1) % this.search_matches.len();
+                                cx.notify();
+                            }
+                        }
+                        AppAction::FindPrevious => {
+                            if !this.search_matches.is_empty() {
+                                this.search_current_idx = if this.search_current_idx == 0 {
+                                    this.search_matches.len() - 1
+                                } else {
+                                    this.search_current_idx - 1
+                                };
+                                cx.notify();
+                            }
+                        }
+                        AppAction::ZoomIn => {
+                            let new_size = (this.font_size + 1.0).min(MAX_FONT_SIZE);
+                            if new_size != this.font_size {
+                                this.font_size = new_size;
+                                this.remeasure_cells(window);
+                                cx.notify();
+                            }
+                        }
+                        AppAction::ZoomOut => {
+                            let new_size = (this.font_size - 1.0).max(MIN_FONT_SIZE);
+                            if new_size != this.font_size {
+                                this.font_size = new_size;
+                                this.remeasure_cells(window);
+                                cx.notify();
+                            }
+                        }
+                        AppAction::ZoomReset => {
+                            if this.font_size != FONT_SIZE {
+                                this.font_size = FONT_SIZE;
+                                this.remeasure_cells(window);
+                                cx.notify();
+                            }
+                        }
+                        AppAction::NewSession => cx.emit(TerminalEvent::NewSession),
+                        AppAction::CloseSession => cx.emit(TerminalEvent::CloseSession),
+                        AppAction::PrevSession => cx.emit(TerminalEvent::PrevSession),
+                        AppAction::NextSession => cx.emit(TerminalEvent::NextSession),
+                        AppAction::SwitchSession(idx) => cx.emit(TerminalEvent::SwitchSession(idx)),
+                        AppAction::ToggleDrawer => cx.emit(TerminalEvent::ToggleDrawer),
+                        AppAction::SendBytes(bytes) => {
                             if let Some(ref terminal) = this.terminal {
-                                terminal.write(&[0x15]);
+                                terminal.write(bytes);
                             }
-                            return;
-                        }
-                        "n" => { cx.emit(TerminalEvent::NewSession); return; }
-                        "w" => { cx.emit(TerminalEvent::CloseSession); return; }
-                        "[" => { cx.emit(TerminalEvent::PrevSession); return; }
-                        "]" => { cx.emit(TerminalEvent::NextSession); return; }
-                        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
-                            if let Ok(num) = key.parse::<usize>() {
-                                cx.emit(TerminalEvent::SwitchSession(num - 1));
-                            }
-                            return;
                         }
                         _ => {}
                     }
+                    return;
                 }
 
+                // ── Terminal input (policy-based) ─────────────────────
                 let Some(ref terminal) = this.terminal else { return };
 
                 // Clear selection on any input to terminal
@@ -988,59 +1021,10 @@ impl Render for TerminalView {
                     }
                 }
 
-                // Handle control key combos
-                if mods.control {
-                    let ctrl_byte = match key {
-                        "a" => Some(0x01), "b" => Some(0x02), "c" => Some(0x03),
-                        "d" => Some(0x04), "e" => Some(0x05), "f" => Some(0x06),
-                        "g" => Some(0x07), "h" => Some(0x08), "k" => Some(0x0b),
-                        "l" => Some(0x0c), "n" => Some(0x0e), "o" => Some(0x0f),
-                        "p" => Some(0x10), "r" => Some(0x12), "t" => Some(0x14),
-                        "u" => Some(0x15), "w" => Some(0x17), "z" => Some(0x1a),
-                        _ => None,
-                    };
-                    if let Some(byte) = ctrl_byte {
-                        terminal.write(&[byte]);
-                        return;
-                    }
-                }
-
-                // Opt+Backspace = macOS "delete previous word".
-                // Send ESC+DEL (Meta-Backspace), which readline and Claude
-                // Code's input editor interpret as backward-kill-word.
-                // Must be checked BEFORE the plain-backspace branch below.
-                if mods.alt && key == "backspace" {
-                    terminal.write(b"\x1b\x7f");
-                    return;
-                }
-
-                // Handle special keys BEFORE key_char — enter, backspace, etc.
-                let special_bytes: Option<&[u8]> = match key {
-                    "enter" => Some(b"\r"),
-                    "backspace" => Some(b"\x7f"),
-                    "tab" => Some(b"\t"),
-                    "escape" => Some(b"\x1b"),
-                    "up" => Some(b"\x1b[A"),
-                    "down" => Some(b"\x1b[B"),
-                    "right" => Some(b"\x1b[C"),
-                    "left" => Some(b"\x1b[D"),
-                    "home" => Some(b"\x1b[H"),
-                    "end" => Some(b"\x1b[F"),
-                    "pageup" => Some(b"\x1b[5~"),
-                    "pagedown" => Some(b"\x1b[6~"),
-                    "delete" => Some(b"\x1b[3~"),
-                    "space" => Some(b" "),
-                    _ => None,
-                };
-
-                if let Some(bytes) = special_bytes {
-                    terminal.write(bytes);
-                    return;
-                }
-
-                // For regular character input, use key_char
-                if let Some(ref key_char) = event.keystroke.key_char {
-                    terminal.write(key_char.as_bytes());
+                // Resolve keystroke → bytes via keymap policy engine
+                let key_char = event.keystroke.key_char.as_deref();
+                if let Some(bytes) = this.keymap.resolve(key, mods, key_char) {
+                    terminal.write(&bytes);
                 }
             }))
             .on_mouse_down(
@@ -1226,6 +1210,22 @@ impl Render for TerminalView {
                     let was_selecting = this.selecting;
                     this.scrollbar_dragging = false;
                     this.selecting = false;
+                    // If the selection is trivially small (same cell or adjacent),
+                    // clear it — single clicks shouldn't leave a highlight.
+                    if let (Some(a), Some(e)) = (this.selection_anchor, this.selection_extent) {
+                        let span = if a.0 == e.0 {
+                            (e.1 as isize - a.1 as isize).unsigned_abs()
+                        } else {
+                            // Multi-line selection is always meaningful
+                            usize::MAX
+                        };
+                        if span < 2 {
+                            this.selection_anchor = None;
+                            this.selection_extent = None;
+                            cx.notify();
+                            return;
+                        }
+                    }
                     // Copy on select (macOS convention: implicit copy after mouse-up from drag)
                     if was_selecting {
                         if let Some(text) = this.get_selected_text() {
@@ -1242,6 +1242,20 @@ impl Render for TerminalView {
                     let was_selecting = this.selecting;
                     this.scrollbar_dragging = false;
                     this.selecting = false;
+                    // Clear trivially small selections on mouse-up-out too.
+                    if let (Some(a), Some(e)) = (this.selection_anchor, this.selection_extent) {
+                        let span = if a.0 == e.0 {
+                            (e.1 as isize - a.1 as isize).unsigned_abs()
+                        } else {
+                            usize::MAX
+                        };
+                        if span < 2 {
+                            this.selection_anchor = None;
+                            this.selection_extent = None;
+                            cx.notify();
+                            return;
+                        }
+                    }
                     if was_selecting {
                         if let Some(text) = this.get_selected_text() {
                             if !text.is_empty() {
@@ -1254,11 +1268,32 @@ impl Render for TerminalView {
             .on_scroll_wheel({
                 let term = self.terminal.as_ref().map(|t| t.term.clone());
                 let scroll_dirty = self.scroll_dirty.clone();
+                let accumulator = self.scroll_pixel_accumulator.clone();
                 let cell_h = self.cell_height;
                 move |event: &ScrollWheelEvent, _window: &mut Window, _cx: &mut App| {
                     let Some(ref term) = term else { return };
-                    let delta = event.delta.pixel_delta(px(cell_h));
-                    let lines = (f32::from(delta.y) / cell_h).round() as i32;
+                    // Trackpad (Pixels) delivers small sub-cell deltas per frame;
+                    // we must accumulate them to produce fluid scrolling. Mouse
+                    // wheel (Lines) delivers discrete line counts and must bypass
+                    // the accumulator so its precision isn't diluted by a stale
+                    // trackpad remainder.
+                    let lines = match event.delta {
+                        ScrollDelta::Pixels(delta_px) => {
+                            let mut acc = accumulator.lock().unwrap();
+                            *acc += f32::from(delta_px.y);
+                            let whole = (*acc / cell_h).trunc() as i32;
+                            if whole != 0 {
+                                *acc -= whole as f32 * cell_h;
+                            }
+                            whole
+                        }
+                        ScrollDelta::Lines(delta_ln) => {
+                            // Mouse wheel — reset any fractional trackpad remainder
+                            // so direction changes between devices feel immediate.
+                            *accumulator.lock().unwrap() = 0.0;
+                            delta_ln.y.round() as i32
+                        }
+                    };
                     if lines != 0 {
                         term.lock().scroll_display(Scroll::Delta(lines));
                         scroll_dirty.store(true, std::sync::atomic::Ordering::Relaxed);

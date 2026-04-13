@@ -1,8 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+use crate::git;
 
 /// Base directory for all workspace clones
 const CLONE_BASE: &str = ".allele/workspaces";
@@ -27,24 +29,34 @@ pub fn create_session_clone(source: &Path, project_name: &str, session_id: &str)
     let short_id: String = session_id.chars().take(8).collect();
     let clone_path = clone_dir.join(&short_id);
 
-    if clone_path.exists() {
+    let final_path = if clone_path.exists() {
         // Unlikely with UUIDs but handle by appending a random suffix
-        return create_clone(source, &format!("{short_id}-alt"));
-    }
+        create_clone(source, &format!("{short_id}-alt"))?
+    } else {
+        let src_cstr = CString::new(source.to_string_lossy().as_bytes())?;
+        let dst_cstr = CString::new(clone_path.to_string_lossy().as_bytes())?;
 
-    let src_cstr = CString::new(source.to_string_lossy().as_bytes())?;
-    let dst_cstr = CString::new(clone_path.to_string_lossy().as_bytes())?;
+        let result = unsafe {
+            libc::clonefile(src_cstr.as_ptr(), dst_cstr.as_ptr(), 0)
+        };
 
-    let result = unsafe {
-        libc::clonefile(src_cstr.as_ptr(), dst_cstr.as_ptr(), 0)
+        if result != 0 {
+            let err = std::io::Error::last_os_error();
+            anyhow::bail!("clonefile() failed: {err}");
+        }
+
+        clone_path
     };
 
-    if result != 0 {
-        let err = std::io::Error::last_os_error();
-        anyhow::bail!("clonefile() failed: {err}");
+    // Pre-register the clone as a trusted workspace in ~/.claude.json so
+    // Claude Code does not prompt on first entry. Non-fatal: a failure
+    // here just means the user sees the trust dialog once, which is the
+    // current baseline behaviour.
+    if let Err(e) = crate::trust::trust_workspace(&final_path) {
+        eprintln!("trust_workspace({}) failed: {e}", final_path.display());
     }
 
-    Ok(clone_path)
+    Ok(final_path)
 }
 
 /// Create an APFS copy-on-write clone of a directory.
@@ -251,8 +263,17 @@ pub fn purge_trash_older_than_days(ttl_days: u64) -> anyhow::Result<usize> {
 /// Walk `~/.allele/workspaces/<project>/*` and move any clone not
 /// present in `referenced` into the trash. Conservative — never deletes.
 ///
+/// `project_sources` maps project names to their canonical source paths.
+/// If the clone has an `allele/session/<id>` branch and the owning
+/// project is in the map, `git::archive_session` runs before trashing
+/// to preserve the orphan's session work in canonical. Archive failure
+/// is logged and non-blocking — the clone is trashed regardless.
+///
 /// Returns the number of clones that were trashed.
-pub fn sweep_orphans(referenced: &HashSet<PathBuf>) -> anyhow::Result<usize> {
+pub fn sweep_orphans(
+    referenced: &HashSet<PathBuf>,
+    project_sources: &HashMap<String, PathBuf>,
+) -> anyhow::Result<usize> {
     let home = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
     let workspace_base = home.join(CLONE_BASE);
@@ -271,6 +292,11 @@ pub fn sweep_orphans(referenced: &HashSet<PathBuf>) -> anyhow::Result<usize> {
         }
 
         let proj_dir = proj_entry.path();
+        let proj_name = proj_entry
+            .file_name()
+            .to_string_lossy()
+            .to_string();
+
         let Ok(iter) = fs::read_dir(&proj_dir) else { continue; };
 
         for clone_entry in iter {
@@ -285,6 +311,23 @@ pub fn sweep_orphans(referenced: &HashSet<PathBuf>) -> anyhow::Result<usize> {
 
             if referenced.contains(&canonical) || referenced.contains(&clone_path) {
                 continue;
+            }
+
+            // Archive the orphan's session work into canonical before
+            // trashing. Resolve canonical from the project name, and
+            // session ID from the clone's current branch. Both must
+            // succeed for the archive to run; otherwise skip silently.
+            if let Some(source_path) = project_sources.get(&proj_name) {
+                if let Some(session_id) = git::current_branch(&clone_path)
+                    .as_deref()
+                    .and_then(git::session_id_from_branch)
+                {
+                    if let Err(e) = git::archive_session(source_path, &clone_path, session_id) {
+                        eprintln!(
+                            "Orphan sweep: archive_session failed for {session_id}: {e}"
+                        );
+                    }
+                }
             }
 
             match trash_clone(&clone_path) {

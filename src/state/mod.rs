@@ -49,10 +49,27 @@ impl PersistedSession {
     }
 }
 
+/// A session that was discarded and archived into canonical's git refs.
+/// Stored in state.json so the archive browser can show a human-readable
+/// label instead of a raw UUID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchivedSession {
+    /// Session UUID — matches the `refs/allele/archive/<id>` ref in canonical.
+    pub id: String,
+    /// Owning project ID (links to `ProjectSave.id` in settings.json).
+    pub project_id: String,
+    /// Display label from the session's sidebar entry at discard time.
+    pub label: String,
+    /// Unix timestamp when the session was archived (seconds since epoch).
+    pub archived_at: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PersistedState {
     #[serde(default)]
     pub sessions: Vec<PersistedSession>,
+    #[serde(default)]
+    pub archived_sessions: Vec<ArchivedSession>,
 }
 
 impl PersistedState {

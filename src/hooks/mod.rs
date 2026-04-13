@@ -67,6 +67,21 @@ fi
 ts=$(date +%s)
 out="$events_dir/$session_id.jsonl"
 printf '{"ts":%s,"kind":"%s"}\n' "$ts" "$kind" >> "$out"
+
+# Capture the first user prompt for session auto-naming.
+# Writes to a .prompt sidecar file (first prompt only — skip if exists).
+if [ "$kind" = "user_prompt_submit" ]; then
+    prompt_file="$events_dir/$session_id.prompt"
+    if [ ! -f "$prompt_file" ]; then
+        if command -v jq >/dev/null 2>&1; then
+            prompt=$(printf '%s' "$payload" | jq -r '.prompt // empty' 2>/dev/null)
+        else
+            prompt=$(printf '%s' "$payload" | sed -n 's/.*"prompt"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+        fi
+        [ -n "$prompt" ] && printf '%s' "$prompt" > "$prompt_file"
+    fi
+fi
+
 exit 0
 "#;
 
@@ -86,7 +101,7 @@ fn build_hooks_json(receiver: &str) -> serde_json::Value {
     };
 
     serde_json::json!({
-        "_allele_version": 2,
+        "_allele_version": 3,
         "hooks": {
             "Notification":        [make_hook("notification")],
             "Stop":                [make_hook("stop")],
@@ -344,6 +359,33 @@ pub fn show_notification(title: &str, body: &str) {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (title, body);
+    }
+}
+
+/// Show a blocking modal dialog via `osascript -e 'display dialog ...'`
+/// with a stop icon and a single OK button. Used for fatal startup errors
+/// that must block before the caller exits the process. Silently no-ops
+/// on non-macOS.
+pub fn show_fatal_dialog(title: &str, body: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        // Escape double quotes for AppleScript, then convert real newlines
+        // into AppleScript's `\n` escape sequence so they render as line
+        // breaks inside `display dialog`.
+        let escape = |s: &str| s.replace('"', "\\\"").replace('\n', "\\n");
+        let script = format!(
+            "display dialog \"{}\" with title \"{}\" with icon stop \
+             buttons {{\"OK\"}} default button 1",
+            escape(body),
+            escape(title)
+        );
+        let _ = Command::new("osascript").arg("-e").arg(script).status();
     }
 
     #[cfg(not(target_os = "macos"))]
