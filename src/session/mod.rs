@@ -71,6 +71,9 @@ pub struct Session {
     /// is subsequently removed, `remove_session` skips creating an archive
     /// entry because the work is already in canonical.
     pub merged: bool,
+    /// Set to `true` once `trigger_auto_naming` has been called for this
+    /// session, to prevent spawning duplicate naming tasks.
+    pub auto_naming_fired: bool,
 }
 
 impl Session {
@@ -90,6 +93,7 @@ impl Session {
             clone_path: None,
             drawer_terminal: None,
             merged: false,
+            auto_naming_fired: false,
         }
     }
 
@@ -116,6 +120,7 @@ impl Session {
             clone_path,
             drawer_terminal: None,
             merged,
+            auto_naming_fired: false,
         }
     }
 

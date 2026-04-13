@@ -475,6 +475,10 @@ impl AppState {
                 .map(|s_idx| (p_idx, s_idx))
         }) else {
             // Event for an unknown session — probably stale, drop it.
+            eprintln!(
+                "hook-event: no matching session for {:?} kind={:?}",
+                event.session_id, event.kind
+            );
             return;
         };
 
@@ -493,15 +497,23 @@ impl AppState {
         use hooks::HookKind;
         use session::SessionStatus;
 
-        // --- Auto-naming: capture data independently of status transitions ---
-        // New sessions start as Running and UserPromptSubmit also maps to
-        // Running, so the status guard below would block auto-naming from
-        // ever being reached. Capture the data here (while we hold the
-        // session borrow) and trigger after the borrow is released.
-        let auto_name_data = if event.kind == HookKind::UserPromptSubmit {
+        // --- Auto-naming: trigger on any event while label is a placeholder ---
+        // Previously gated on UserPromptSubmit only, but that event could be
+        // missed in edge cases (race with session addition, duplicate events,
+        // etc.). Now we trigger on ANY event for a placeholder-labelled session,
+        // using the `auto_naming_fired` flag to prevent duplicate spawns.
+        // The background task is idempotent — it reads the .prompt sidecar
+        // file (which only exists after the first UserPromptSubmit hook) and
+        // retries if it hasn't appeared yet.
+        let auto_name_data = if !session.auto_naming_fired {
             let is_placeholder = session.label.starts_with("Claude ")
                 || session.label.starts_with("Shell ");
             if is_placeholder {
+                session.auto_naming_fired = true;
+                eprintln!(
+                    "auto-naming: triggered for {} label={:?} on {:?}",
+                    session.id, session.label, event.kind
+                );
                 Some((session.id.clone(), session.clone_path.clone()))
             } else {
                 None
@@ -622,12 +634,15 @@ impl AppState {
         let Some(events_dir) = hooks::events_dir() else { return; };
 
         cx.spawn(async move |this, cx| {
-            // Read the .prompt file (written by the hook receiver).
-            // Retry a few times with short delays — the hook script runs
-            // asynchronously and the file may not exist yet.
+            // Read the .prompt file (written by the hook receiver on the first
+            // UserPromptSubmit). Since auto-naming now fires on the very first
+            // hook event (often session_start, which precedes the user typing),
+            // we use a generous retry window: 30 attempts × 2s = 60s total.
+            // This covers the common case where the user takes a few seconds
+            // to type their first prompt after the session starts.
             let prompt_path = events_dir.join(format!("{session_id}.prompt"));
             let mut prompt_text = None;
-            for _ in 0..6 {
+            for attempt in 0..30 {
                 if let Ok(text) = std::fs::read_to_string(&prompt_path) {
                     if !text.trim().is_empty() {
                         prompt_text = Some(text);
@@ -635,12 +650,15 @@ impl AppState {
                     }
                 }
                 cx.background_executor()
-                    .timer(std::time::Duration::from_millis(500))
+                    .timer(std::time::Duration::from_millis(2000))
                     .await;
+                if attempt == 0 {
+                    eprintln!("auto-naming: waiting for prompt file for {session_id}");
+                }
             }
 
             let Some(prompt) = prompt_text else {
-                eprintln!("auto-naming: no prompt file found after retries for {session_id}");
+                eprintln!("auto-naming: no prompt file found after 60s for {session_id}");
                 return;
             };
             eprintln!(
