@@ -27,6 +27,11 @@ SOURCE_PLIST="$PROJECT_DIR/resources/Info.plist"
 # Create bundle structure if missing
 mkdir -p "$MACOS_DIR"
 
+# Remove stale symlink left by earlier script versions — if $LINK is a
+# symlink pointing at $BINARY, `cat >` would follow it and clobber the
+# compiled binary with the launcher script.
+[[ -L "$LINK" ]] && rm -f "$LINK"
+
 # Copy Info.plist if missing or outdated
 if [[ ! -f "$PLIST" ]] || ! cmp -s "$SOURCE_PLIST" "$PLIST"; then
     cp "$SOURCE_PLIST" "$PLIST"
