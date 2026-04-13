@@ -1590,7 +1590,7 @@ impl Render for AppState {
                                 let project = self.projects.get_mut(cursor.project_idx).unwrap();
                                 project.loading_sessions.push(project::LoadingSession {
                                     id: placeholder_id.clone(),
-                                    label: format!("{session_label} (merging)"),
+                                    label: format!("{session_label} (rebasing & merging)"),
                                 });
 
                                 // Remove the session from the list now (frees PTY).
@@ -1607,16 +1607,36 @@ impl Render for AppState {
                                             // 1. Auto-commit + fetch session branch as archive ref
                                             git::archive_session(&canonical, &clone_path, &session_id)?;
 
-                                            // 2. Merge the archive ref into canonical HEAD
+                                            // 2. Fetch origin & rebase canonical onto remote tip
+                                            if git::has_remote(&canonical, "origin") {
+                                                match git::fetch_and_rebase_onto_remote(&canonical, "origin") {
+                                                    Ok(true) => eprintln!("Rebased canonical onto origin for {session_id}"),
+                                                    Ok(false) => eprintln!("Canonical already up to date with origin for {session_id}"),
+                                                    Err(e) => {
+                                                        eprintln!("Rebase onto origin failed for {session_id}: {e}");
+                                                        // Clean up archive ref and clone before bailing
+                                                        let _ = git::delete_ref(
+                                                            &canonical,
+                                                            &git::archive_ref_name(&session_id),
+                                                        );
+                                                        if let Err(e) = clone::delete_clone(&clone_path) {
+                                                            eprintln!("Failed to delete clone after rebase failure for {session_id}: {e}");
+                                                        }
+                                                        anyhow::bail!("Rebase failed: {e}");
+                                                    }
+                                                }
+                                            }
+
+                                            // 3. Merge the archive ref into canonical HEAD
                                             let merge_result = git::merge_archive(&canonical, &session_id);
 
-                                            // 3. Always delete the archive ref (cleanup even on merge failure)
+                                            // 4. Always delete the archive ref (cleanup even on merge failure)
                                             let _ = git::delete_ref(
                                                 &canonical,
                                                 &git::archive_ref_name(&session_id),
                                             );
 
-                                            // 4. Delete the APFS clone
+                                            // 5. Delete the APFS clone
                                             if let Err(e) = clone::delete_clone(&clone_path) {
                                                 eprintln!("Failed to delete clone after merge for {session_id}: {e}");
                                             }
