@@ -88,6 +88,11 @@ pub struct Session {
     /// Set to `true` once `trigger_auto_naming` has been called for this
     /// session, to prevent spawning duplicate naming tasks.
     pub auto_naming_fired: bool,
+    /// Port allocated for this session's `{{unique_port}}` substitution.
+    /// Re-allocated on every session materialisation (creation + resume).
+    /// Not persisted — the value isn't useful across app restarts because
+    /// the process holding it is gone.
+    pub allocated_port: Option<u16>,
 }
 
 impl Session {
@@ -111,6 +116,7 @@ impl Session {
             drawer_visible: false,
             merged: false,
             auto_naming_fired: false,
+            allocated_port: None,
         }
     }
 
@@ -141,6 +147,7 @@ impl Session {
             drawer_visible: false,
             merged,
             auto_naming_fired: false,
+            allocated_port: None,
         }
     }
 

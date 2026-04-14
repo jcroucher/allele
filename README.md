@@ -50,7 +50,7 @@ If that's not you, you're probably better served by tmux, iTerm2 split panes, or
 - Scrollbar with fade animation
 - Font size adjustment (Cmd+/-, Cmd+0 reset)
 - Policy-based keymap with readline-friendly Option+key (Meta mode)
-- Per-session drawer terminal panel (Cmd+J) for running shell commands alongside Claude
+- Per-session drawer terminal panel (Cmd+J) with multiple named tabs — click `+` to add, double-click a tab name to rename, `×` to close
 
 ### Sessions
 - 6 status states: Running ●, Idle ○, Done ✓, Suspended ⏸, AwaitingInput ⚠, ResponseReady ★
@@ -78,6 +78,64 @@ If that's not you, you're probably better served by tmux, iTerm2 split panes, or
 - Add/remove projects via sidebar or folder picker
 - Project relocation when source path moves
 - Per-project session list with expand/collapse
+- Optional `allele.json` at the project root for declarative session setup (see below)
+
+## Per-project configuration (`allele.json`)
+
+Drop an `allele.json` at the root of any project to declare the drawer
+terminals and preview URL that every session should start with. On session
+creation and on every cold-resume, Allele reads this file, allocates one free
+local TCP port in `40000..=49999`, substitutes placeholders, spawns a drawer
+tab per entry running your interactive login shell, pipes the substituted
+command into that shell as its first input (so it runs as if you typed it),
+opens the drawer, and opens the preview URL in your default browser. Because
+each tab is a real interactive shell, you can Ctrl+C the command, re-run it,
+or do anything else in that tab.
+
+Example:
+
+```json
+{
+  "terminals": [
+    { "label": "Server",   "command": "./bin/dev -p {{unique_port}}" },
+    { "label": "Logs",     "command": "tail -f {{folder}}/log/development.log" },
+    { "label": "Terminal", "command": "" }
+  ],
+  "preview": {
+    "url": "http://127.0.0.1:{{unique_port}}"
+  }
+}
+```
+
+**Fields**
+
+- `terminals[]` — one drawer tab per entry.
+  - `label` — the tab's display name.
+  - `command` — a shell command piped into the tab's interactive shell at
+    startup. Runs under your real `$SHELL`, so aliases, rc files, and job
+    control (Ctrl+C / `bg` / `fg`) all work. Empty string leaves the shell
+    at an empty prompt.
+- `preview.url` — optional. Opened in the system browser once per
+  materialisation (creation and resume).
+
+**Placeholders**
+
+- `{{unique_port}}` — a free TCP port allocated once per session, shared by
+  every `{{unique_port}}` in the file (so the server tab and the preview URL
+  always match). If no port in `40000..=49999` is free, the placeholder is
+  left unsubstituted and a warning is logged.
+- `{{folder}}` — the session's clone path (the APFS copy-on-write workspace
+  for that session, not the original project source). Useful for absolute
+  paths in log commands or subprocess invocations.
+
+**Behaviour notes**
+
+- Missing or malformed `allele.json` is silently ignored — the session
+  behaves as if there were no config (plain drawer, no preview).
+- A fresh port is allocated on every resume, so the preview URL will differ
+  between sessions and across restarts.
+- The file is read from the session's clone, so each session can override
+  the config by editing its own copy if needed.
 
 ## Architecture (short version)
 
