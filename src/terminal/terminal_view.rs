@@ -354,6 +354,17 @@ impl TerminalView {
         self.terminal.as_ref().map_or(true, |t| t.exited)
     }
 
+    /// Write bytes directly to the PTY, as if the user had typed them.
+    /// Used to inject startup commands into interactive shells spawned by
+    /// `allele.json` — the shell reads them from its stdin buffer once the
+    /// rc files finish loading, so the command runs but the shell stays
+    /// interactive afterwards.
+    pub fn send_input(&self, bytes: &[u8]) {
+        if let Some(ref t) = self.terminal {
+            t.write(bytes);
+        }
+    }
+
     /// Get the current terminal title set by the shell via OSC sequences.
     pub fn title(&self) -> Option<String> {
         self.terminal.as_ref().and_then(|t| t.title.clone())

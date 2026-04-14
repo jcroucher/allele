@@ -1,6 +1,7 @@
 mod terminal;
 mod sidebar;
 mod clone;
+mod config;
 mod git;
 mod hooks;
 mod project;
@@ -426,7 +427,9 @@ impl AppState {
                 let Some(project) = this.projects.get_mut(project_idx) else { return; };
                 project.sessions.push(session);
                 let session_idx = project.sessions.len() - 1;
-                this.active = Some(SessionCursor { project_idx, session_idx });
+                let cursor = SessionCursor { project_idx, session_idx };
+                this.active = Some(cursor);
+                this.apply_project_config(cursor, window, cx);
                 this.save_state();
                 cx.notify();
             });
@@ -474,11 +477,14 @@ impl AppState {
     }
 
     /// Spawn one drawer terminal tab in the given session with an optional
-    /// pre-chosen name. Default name is "Terminal N" where N is 1-based.
+    /// pre-chosen name and optional shell command. Default name is
+    /// "Terminal N" where N is 1-based; default command drops into the
+    /// user's shell.
     fn spawn_drawer_tab(
         &mut self,
         cursor: SessionCursor,
         name: Option<String>,
+        command: Option<ShellCommand>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -486,7 +492,7 @@ impl AppState {
             .get(cursor.project_idx)
             .and_then(|p| p.sessions.get(cursor.session_idx))
             .and_then(|s| s.clone_path.clone());
-        let drawer_tv = cx.new(|cx| TerminalView::new(window, cx, None, working_dir));
+        let drawer_tv = cx.new(|cx| TerminalView::new(window, cx, command, working_dir));
         cx.subscribe(
             &drawer_tv,
             |this: &mut Self,
@@ -542,10 +548,10 @@ impl AppState {
         };
 
         if needs_default {
-            self.spawn_drawer_tab(cursor, None, window, cx);
+            self.spawn_drawer_tab(cursor, None, None, window, cx);
         } else if !pending.is_empty() {
             for name in pending {
-                self.spawn_drawer_tab(cursor, Some(name), window, cx);
+                self.spawn_drawer_tab(cursor, Some(name), None, window, cx);
             }
             if let Some(session) = self.projects
                 .get_mut(cursor.project_idx)
@@ -555,6 +561,85 @@ impl AppState {
                 if session.drawer_active_tab >= session.drawer_tabs.len() {
                     session.drawer_active_tab = session.drawer_tabs.len().saturating_sub(1);
                 }
+            }
+        }
+    }
+
+    /// Read `allele.json` from the session's clone path and apply it:
+    /// allocate a port, pre-spawn a drawer tab per `terminals[]` entry, show
+    /// the drawer, and open the preview URL in the system browser.
+    ///
+    /// No-op when the file is missing or malformed. Called from both
+    /// `add_session_to_project` (after the clone lands) and `resume_session`
+    /// (on every cold-resume), so edits to allele.json pick up naturally.
+    fn apply_project_config(
+        &mut self,
+        cursor: SessionCursor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let clone_path = self
+            .projects
+            .get(cursor.project_idx)
+            .and_then(|p| p.sessions.get(cursor.session_idx))
+            .and_then(|s| s.clone_path.clone());
+        let Some(clone_path) = clone_path else { return };
+        let Some(cfg) = config::ProjectConfig::load(&clone_path) else { return };
+
+        let port = config::allocate_port();
+
+        // Drop any pre-existing drawer tabs from a prior materialisation —
+        // the config is the source of truth for this session's layout.
+        if let Some(session) = self
+            .projects
+            .get_mut(cursor.project_idx)
+            .and_then(|p| p.sessions.get_mut(cursor.session_idx))
+        {
+            session.drawer_tabs.clear();
+            session.pending_drawer_tab_names.clear();
+            session.drawer_active_tab = 0;
+            session.allocated_port = port;
+        }
+
+        for term in &cfg.terminals {
+            let substituted = config::substitute(&term.command, port, &clone_path);
+            // Always spawn an interactive shell (inherit default — None).
+            // If a startup command was declared, push it into the PTY's
+            // stdin buffer so the freshly-loaded shell reads and executes
+            // it as if the user had typed it. When the command exits or is
+            // interrupted (Ctrl+C), the shell is still there for the user
+            // to restart or run anything else.
+            self.spawn_drawer_tab(cursor, Some(term.label.clone()), None, window, cx);
+            if !substituted.trim().is_empty() {
+                if let Some(session) = self
+                    .projects
+                    .get(cursor.project_idx)
+                    .and_then(|p| p.sessions.get(cursor.session_idx))
+                {
+                    if let Some(tab) = session.drawer_tabs.last() {
+                        let mut line = substituted.into_bytes();
+                        line.push(b'\n');
+                        tab.view.read(cx).send_input(&line);
+                    }
+                }
+            }
+        }
+
+        if !cfg.terminals.is_empty() {
+            if let Some(session) = self
+                .projects
+                .get_mut(cursor.project_idx)
+                .and_then(|p| p.sessions.get_mut(cursor.session_idx))
+            {
+                session.drawer_active_tab = 0;
+                session.drawer_visible = true;
+            }
+        }
+
+        if let Some(preview) = cfg.preview {
+            let url = config::substitute(&preview.url, port, &clone_path);
+            if let Err(e) = std::process::Command::new("open").arg(&url).spawn() {
+                eprintln!("allele: failed to open preview URL {url}: {e}");
             }
         }
     }
@@ -1036,6 +1121,7 @@ impl AppState {
             self.pending_action = Some(PendingAction::FocusActive);
         }
 
+        self.apply_project_config(cursor, window, cx);
         self.save_state();
         cx.notify();
     }
@@ -2048,7 +2134,7 @@ impl Render for AppState {
                 PendingAction::NewDrawerTab => {
                     skip_refocus = true;
                     if let Some(cursor) = self.active {
-                        self.spawn_drawer_tab(cursor, None, window, cx);
+                        self.spawn_drawer_tab(cursor, None, None, window, cx);
                         if let Some(session) = self.projects
                             .get_mut(cursor.project_idx)
                             .and_then(|p| p.sessions.get_mut(cursor.session_idx))
